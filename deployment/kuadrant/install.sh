@@ -930,6 +930,7 @@ esac
 
 # ────────────────────────────── 7. Gateway policies ──────────────────────────
 echo "🔧 7. Applying API-key auth & rate-limit policies"
+echo "  - Creating API key secrets for free, premium, and enterprise tiers..."
 kubectl apply -f 05-api-key-secrets.yaml
 
 # Check if token-based rate limiting is requested
@@ -944,6 +945,26 @@ if [[ "$TOKEN_RATE_LIMIT" == true ]]; then
     echo "    - Free tier: 200 tokens"
     echo "    - Premium tier: 1,000 tokens"
     echo "    - Enterprise tier: 5,000 tokens"
+    echo "    - Enterprise tier: 5,000 tokens"
+    
+    # Restart gateways to apply the EnvoyFilter
+    echo "🔄 Restarting gateways to apply token rate limiting..."
+    
+    # Check if inference-gateway-istio exists (Gateway API gateway)
+    if kubectl get deployment inference-gateway-istio -n istio-system &>/dev/null; then
+      echo "  - Restarting inference-gateway-istio..."
+      kubectl rollout restart deployment/inference-gateway-istio -n istio-system
+      kubectl rollout status deployment/inference-gateway-istio -n istio-system --timeout=60s
+    fi
+    
+    # Check if istio-ingressgateway exists (native Istio)
+    if kubectl get deployment istio-ingressgateway -n istio-system &>/dev/null; then
+      echo "  - Restarting istio-ingressgateway..."
+      kubectl rollout restart deployment/istio-ingressgateway -n istio-system
+      kubectl rollout status deployment/istio-ingressgateway -n istio-system --timeout=60s
+    fi
+    
+    echo "  ✅ Gateways restarted to enable token rate limiting"
   else
     echo "  ⚠️  Token rate limit configuration not found"
     echo "  Using default request-based rate limiting"
@@ -965,12 +986,15 @@ if [[ "$OCP" == true ]]; then
     done
     
     # Apply policies in istio-system namespace (same as Gateway)
-    echo "🔧 Applying AuthPolicy and RateLimitPolicy in istio-system..."
+    echo "🔧 Applying AuthPolicy in istio-system..."
     # Apply AuthPolicy in istio-system namespace
     sed 's/namespace: llm/namespace: istio-system/' 06-auth-policies-apikey.yaml | kubectl apply -f -
     
-    # Apply RateLimitPolicy in istio-system namespace
-    sed 's/namespace: llm/namespace: istio-system/' 07-rate-limit-policies.yaml | kubectl apply -f -
+    # Apply request-based RateLimitPolicy only if not using token-based
+    if [[ "$TOKEN_RATE_LIMIT" == false ]]; then
+      echo "🔧 Applying request-based RateLimitPolicy in istio-system..."
+      sed 's/namespace: llm/namespace: istio-system/' 07-rate-limit-policies.yaml | kubectl apply -f -
+    fi
     
     # Restart Kuadrant components to ensure policies are applied
     kubectl rollout restart deployment/authorino -n kuadrant-system
@@ -982,7 +1006,11 @@ if [[ "$OCP" == true ]]; then
     echo ""
     echo "✅ Gateway API configuration complete"
     echo "   - Authentication: ✅ ENABLED"
-    echo "   - Rate Limiting: ✅ ENABLED (5 req/2min for free, 20 req/2min for premium)"
+    if [[ "$TOKEN_RATE_LIMIT" == true ]]; then
+      echo "   - Rate Limiting: ✅ TOKEN-BASED (200/1000/5000 tokens per minute)"
+    else
+      echo "   - Rate Limiting: ✅ REQUEST-BASED (5 req/2min for free, 20 req/2min for premium)"
+    fi
     echo "   - Policies and secrets in istio-system namespace"
     
   else
@@ -1005,6 +1033,8 @@ if [[ "$OCP" == true ]]; then
     echo "🔧 Applying AuthConfig..."
     kubectl apply -f 06-authconfig-istio.yaml
     
+    # Token rate limiting via EnvoyFilter is already applied above if requested
+    
     # Restart Istio ingress gateway to apply EnvoyFilter
     echo "🔄 Restarting Istio ingress gateway..."
     kubectl rollout restart deployment/istio-ingressgateway -n istio-system
@@ -1020,7 +1050,11 @@ if [[ "$OCP" == true ]]; then
     echo "   - Secrets must be in kuadrant-system namespace"
     echo "   - Use format: Authorization: APIKEY <key> (note: no space after APIKEY)"
     echo "   - Authentication: ✅ WORKING"
-    echo "   - Rate Limiting: ❌ NOT AVAILABLE (RateLimitPolicy doesn't support native Istio)"
+    if [[ "$TOKEN_RATE_LIMIT" == true ]]; then
+      echo "   - Rate Limiting: ✅ TOKEN-BASED via EnvoyFilter (200/1000/5000 tokens per minute)"
+    else
+      echo "   - Rate Limiting: ❌ NOT AVAILABLE (RateLimitPolicy doesn't support native Istio)"
+    fi
   fi
 else
   # For vanilla Kubernetes with Gateway API
@@ -1032,6 +1066,7 @@ else
     echo ""
     echo "✅ Gateway API authentication and request-based rate limiting configured"
   else
+    # Token-based limiting via EnvoyFilter already applied above
     echo ""
     echo "✅ Gateway API authentication and token-based rate limiting configured"
   fi
@@ -1158,14 +1193,17 @@ echo "📊  Available API keys"
 if [[ "$TOKEN_RATE_LIMIT" == true ]]; then
   echo "    Free:      freeuser1_key, freeuser2_key (200 tokens/min)"
   echo "    Premium:   premiumuser1_key, premiumuser2_key (1,000 tokens/min)"
-  echo "    Enterprise: (future) (5,000 tokens/min)"
+  echo "    Enterprise: enterpriseuser1_key (5,000 tokens/min)"
   echo ""
   echo "📈 Token counting:"
-  echo "    - Response headers will include: x-tokens-used, x-tokens-limit, x-tokens-remaining"
-  echo "    - Tokens are counted from model's 'usage' field in response"
+  echo "    - Response headers: x-ratelimit-limit-tokens, x-ratelimit-consumed-tokens, x-ratelimit-remaining-tokens"
+  echo "    - Tokens are counted from model's 'usage.total_tokens' field"
+  echo "    - Simulator always returns 30 tokens per request"
+  echo "    - Qwen returns actual token usage based on input/output"
 else
   echo "    Free:      freeuser1_key, freeuser2_key (5 req/2 min)"
   echo "    Premium:   premiumuser1_key, premiumuser2_key (20 req/2 min)"
+  echo "    Enterprise: enterpriseuser1_key (100 req/2 min)"
 fi
 
 if [[ "$OCP" == true ]]; then
@@ -1177,23 +1215,40 @@ if [[ "$OCP" == true ]]; then
     echo "   - Route in istio-system namespace"
     echo "   - Format: Authorization: APIKEY <key>"
     echo "   - Authentication: ✅ WORKING"
-    echo "   - Rate Limiting: ✅ WORKING"
+    if [[ "$TOKEN_RATE_LIMIT" == true ]]; then
+      echo "   - Rate Limiting: ✅ TOKEN-BASED"
+    else
+      echo "   - Rate Limiting: ✅ REQUEST-BASED"
+    fi
   else
-    echo "⚠️  Configuration: Native Istio (authentication only)"
+    echo "⚠️  Configuration: Native Istio"
     echo "   - Using EnvoyFilter + AuthConfig"
     echo "   - Secrets in kuadrant-system namespace"
     echo "   - Format: Authorization: APIKEY <key> (no space after APIKEY)"
     echo "   - Authentication: ✅ WORKING"
-    echo "   - Rate Limiting: ❌ NOT AVAILABLE (RateLimitPolicy doesn't support native Istio)"
+    if [[ "$TOKEN_RATE_LIMIT" == true ]]; then
+      echo "   - Rate Limiting: ✅ TOKEN-BASED via EnvoyFilter"
+    else
+      echo "   - Rate Limiting: ❌ NOT AVAILABLE (RateLimitPolicy doesn't support native Istio)"
+    fi
   fi
   echo ""
-  echo "   Test script available: ./test-maas-auth.sh"
+  if [[ "$TOKEN_RATE_LIMIT" == true ]]; then
+    echo "   Test token limits: ./test-token-limits.sh"
+  else
+    echo "   Test script available: ./test-maas-auth.sh"
+  fi
 else
   echo "    Forward the inference gateway with → kubectl port-forward -n llm svc/inference-gateway-istio 8000:80"
+  if [[ "$TOKEN_RATE_LIMIT" == true ]]; then
+    echo "    Test token limits: ./test-token-limits.sh"
+  fi
 fi
 
-echo "    🤖 Run an automated quota stress with → scripts/test-request-limits.sh"
-echo
+if [[ "$TOKEN_RATE_LIMIT" == false ]]; then
+  echo "    🤖 Run an automated quota stress with → scripts/test-request-limits.sh"
+fi
+
 echo "🔥 Deploy complete"
 
 if [[ "$OCP" == true ]]; then

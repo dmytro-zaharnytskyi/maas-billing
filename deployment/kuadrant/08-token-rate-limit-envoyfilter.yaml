@@ -7,6 +7,9 @@ metadata:
   name: token-rate-limit-filter
   namespace: istio-system
 spec:
+  workloadSelector:
+    labels:
+      gateway.networking.k8s.io/gateway-name: inference-gateway  # Target the inference gateway
   configPatches:
   # Add Lua script for token counting
   - applyTo: HTTP_FILTER
@@ -27,15 +30,29 @@ spec:
           inline_code: |
             -- Token counting and rate limiting logic
             function envoy_on_request(request_handle)
-              -- Get user identity from auth headers
-              local auth_header = request_handle:headers():get("x-auth-userid")
-              local user_group = request_handle:headers():get("x-auth-groups")
+              -- Get user identity from auth headers (set by Kuadrant/Authorino)
+              local auth_header = request_handle:headers():get("authorization")
               
               if auth_header == nil then
                 return
               end
               
+              -- Extract API key from "APIKEY xxx" format
+              local api_key = string.match(auth_header, "APIKEY%s+(%S+)")
+              if api_key == nil then
+                return
+              end
+              
               -- Define token limits per minute based on user tier
+              -- Map API keys to tiers (this should match your secrets)
+              local user_tiers = {
+                ["freeuser1_key"] = "free",
+                ["freeuser2_key"] = "free",
+                ["premiumuser1_key"] = "premium",
+                ["premiumuser2_key"] = "premium",
+                ["enterpriseuser1_key"] = "enterprise"
+              }
+              
               local token_limits = {
                 free = 200,      -- 200 tokens per minute
                 premium = 1000,  -- 1000 tokens per minute
@@ -43,21 +60,15 @@ spec:
               }
               
               -- Get user's tier
-              local user_tier = "free"  -- default
-              if user_group ~= nil then
-                if string.find(user_group, "premium") then
-                  user_tier = "premium"
-                elseif string.find(user_group, "enterprise") then
-                  user_tier = "enterprise"
-                end
-              end
+              local user_tier = user_tiers[api_key] or "free"  -- default to free
               
               -- Store user info for response processing
+              request_handle:headers():add("x-user-key", api_key)
               request_handle:headers():add("x-user-tier", user_tier)
               request_handle:headers():add("x-token-limit", tostring(token_limits[user_tier]))
               
               -- Check current token usage from shared data
-              local key = "tokens:" .. auth_header
+              local key = "tokens:" .. api_key
               local current_minute = os.date("%Y%m%d%H%M")
               local usage_key = key .. ":" .. current_minute
               
@@ -67,6 +78,9 @@ spec:
               else
                 current_usage = tonumber(current_usage)
               end
+              
+              -- Log for debugging
+              request_handle:logInfo("Token rate limit check: user=" .. api_key .. " tier=" .. user_tier .. " usage=" .. current_usage .. "/" .. token_limits[user_tier])
               
               -- Check if user has exceeded limit
               if current_usage >= token_limits[user_tier] then
@@ -86,10 +100,11 @@ spec:
               end
               
               local body_str = body:getBytes(0, body:length())
-              local auth_header = response_handle:headers():get("x-auth-userid")
+              local api_key = response_handle:headers():get("x-user-key")
               local user_tier = response_handle:headers():get("x-user-tier")
+              local token_limit = response_handle:headers():get("x-token-limit")
               
-              if auth_header == nil or user_tier == nil then
+              if api_key == nil or user_tier == nil then
                 return
               end
               
@@ -103,11 +118,18 @@ spec:
                 total_tokens = tonumber(tokens)
               else
                 -- Fallback: estimate tokens (roughly 4 chars per token)
-                total_tokens = string.len(body_str) / 4
+                -- Only for responses that look like completions
+                if string.find(body_str, '"choices"') then
+                  local content_pattern = '"content":%s*"([^"]*)"'
+                  local content = string.match(body_str, content_pattern)
+                  if content ~= nil then
+                    total_tokens = math.ceil(string.len(content) / 4)
+                  end
+                end
               end
               
               -- Update token usage
-              local key = "tokens:" .. auth_header
+              local key = "tokens:" .. api_key
               local current_minute = os.date("%Y%m%d%H%M")
               local usage_key = key .. ":" .. current_minute
               
@@ -122,94 +144,20 @@ spec:
               response_handle:sharedData():set(usage_key, tostring(current_usage), 60) -- TTL 60 seconds
               
               -- Add headers with token information
-              response_handle:headers():add("x-tokens-used", tostring(total_tokens))
-              response_handle:headers():add("x-tokens-limit", response_handle:headers():get("x-token-limit"))
-              response_handle:headers():add("x-tokens-remaining", tostring(tonumber(response_handle:headers():get("x-token-limit")) - current_usage))
+              response_handle:headers():add("x-ratelimit-limit-tokens", token_limit)
+              response_handle:headers():add("x-ratelimit-consumed-tokens", tostring(total_tokens))
+              response_handle:headers():add("x-ratelimit-remaining-tokens", tostring(tonumber(token_limit) - current_usage))
+              
+              -- Clean up internal headers
+              response_handle:headers():remove("x-user-key")
+              response_handle:headers():remove("x-user-tier")
+              response_handle:headers():remove("x-token-limit")
+              
+              -- Log for debugging
+              response_handle:logInfo("Token usage recorded: user=" .. api_key .. " tokens=" .. total_tokens .. " total=" .. current_usage)
             end
 ---
-# Alternative implementation using WASM for better performance
-apiVersion: networking.istio.io/v1alpha3
-kind: EnvoyFilter
-metadata:
-  name: token-rate-limit-wasm
-  namespace: istio-system
-spec:
-  configPatches:
-  - applyTo: HTTP_FILTER
-    match:
-      context: GATEWAY
-      listener:
-        filterChain:
-          filter:
-            name: "envoy.filters.network.http_connection_manager"
-    patch:
-      operation: INSERT_BEFORE
-      value:
-        name: token-rate-limiter
-        typed_config:
-          "@type": type.googleapis.com/udpa.type.v1.TypedStruct
-          type_url: type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
-          value:
-            config:
-              root_id: token_rate_limiter
-              vm_config:
-                vm_id: token_rate_limiter
-                runtime: "envoy.wasm.runtime.v8"
-                code:
-                  local:
-                    inline_string: |
-                      const rootContext = {
-                        onRequestHeaders() {
-                          const headers = this.request_headers;
-                          const userId = headers['x-auth-userid'];
-                          const userGroups = headers['x-auth-groups'] || '';
-                          
-                          if (!userId) return FilterHeadersStatus.Continue;
-                          
-                          // Determine user tier and limits
-                          let tokenLimit = 200; // default free tier
-                          if (userGroups.includes('premium')) {
-                            tokenLimit = 1000;
-                          } else if (userGroups.includes('enterprise')) {
-                            tokenLimit = 5000;
-                          }
-                          
-                          // Check token usage (simplified - real impl would use external store)
-                          const currentMinute = new Date().toISOString().slice(0, 16);
-                          const usageKey = `tokens:${userId}:${currentMinute}`;
-                          
-                          // Store for response processing
-                          this.setProperty(['user_id'], userId);
-                          this.setProperty(['token_limit'], tokenLimit);
-                          
-                          return FilterHeadersStatus.Continue;
-                        },
-                        
-                        onResponseBody() {
-                          const body = this.response_body;
-                          const userId = this.getProperty(['user_id']);
-                          const tokenLimit = this.getProperty(['token_limit']);
-                          
-                          if (!userId || !body) return FilterDataStatus.Continue;
-                          
-                          // Parse token usage from response
-                          try {
-                            const response = JSON.parse(body);
-                            const tokensUsed = response.usage?.total_tokens || 0;
-                            
-                            // Add response headers
-                            this.response_headers['x-tokens-used'] = tokensUsed.toString();
-                            this.response_headers['x-tokens-limit'] = tokenLimit.toString();
-                            
-                          } catch (e) {
-                            // Fallback to estimation
-                          }
-                          
-                          return FilterDataStatus.Continue;
-                        }
-                      };
----
-# ConfigMap for token limits configuration
+# ConfigMap for token limits configuration (optional, for easy updates)
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -217,6 +165,7 @@ metadata:
   namespace: istio-system
 data:
   limits.yaml: |
+    # Token limits per tier
     tiers:
       free:
         tokens_per_minute: 200
@@ -231,8 +180,9 @@ data:
         tokens_per_hour: 150000
         tokens_per_day: 2000000
     
-    # Model-specific multipliers (some models cost more)
+    # Model-specific multipliers (for future use)
     model_multipliers:
+      "simulator-model": 1.0
       "qwen3-0-6b-instruct": 1.0
       "llama-3-8b": 1.5
       "mixtral-8x7b": 2.0 

@@ -254,3 +254,247 @@ This document consolidates all development activities, issues encountered, and r
 - Implement Redis for distributed token counting.
 - Add billing integration based on token usage.
 - Monitor performance and adjust limits.
+
+## Installation Script Comprehensive Guide
+
+### Overview
+The `install.sh` script is the central deployment tool for the MaaS system, providing comprehensive support for both vanilla Kubernetes and OpenShift environments with automatic detection and platform-specific configurations.
+
+### Key Features
+- **Platform Auto-Detection**: Automatically detects OpenShift vs vanilla Kubernetes
+- **GPU Support**: `--check-gpu` flag for GPU node verification
+- **Token-Based Rate Limiting**: `--token-rate-limit` flag for advanced rate limiting
+- **Model Deployment**: Flags for deploying vLLM simulator (`--simulator`) and Qwen3 (`--qwen3`)
+- **Gateway API Support**: Automatic detection and configuration
+- **Comprehensive Error Handling**: Detailed logging and rollback capabilities
+
+### Command-Line Options
+```bash
+./install.sh [OPTIONS]
+
+Options:
+  --simulator          Deploy vLLM simulator model
+  --qwen3              Deploy Qwen3 GPU model
+  --check-gpu          Check for GPU nodes before deployment
+  --token-rate-limit   Enable token-based rate limiting (instead of request-based)
+  --openshift-routes   Create OpenShift routes (for OpenShift only)
+  --skip-rhoai         Skip RHOAI setup (for OpenShift)
+  --help               Show help message
+```
+
+### Token-Based Rate Limiting Configuration
+
+#### Implementation Details
+- **EnvoyFilter**: Uses Lua script to count tokens from model responses
+- **Tier Limits**: 
+  - Free: 200 tokens/minute
+  - Premium: 1,000 tokens/minute
+  - Enterprise: 5,000 tokens/minute
+- **Gateway Restart**: Automatically restarts gateway deployments after applying EnvoyFilter
+- **Platform Support**: Works on both Kubernetes and OpenShift
+
+#### How Token Counting Works
+1. **Request Interception**: EnvoyFilter intercepts all requests to `/v1/chat/completions`
+2. **API Key Extraction**: Lua script extracts API key from `Authorization: APIKEY <key>` header
+3. **Tier Mapping**: Maps API key to user tier (free/premium/enterprise)
+4. **Response Processing**: Counts tokens from response `usage.total_tokens` field
+5. **Rate Limit Enforcement**: Blocks requests if user exceeds tier limit
+6. **Header Injection**: Adds rate limit info to response headers
+
+#### Response Headers
+- `x-ratelimit-limit-tokens`: Total token limit per minute
+- `x-ratelimit-consumed-tokens`: Tokens consumed in current request
+- `x-ratelimit-remaining-tokens`: Tokens remaining in current window
+
+## Comprehensive Testing Guide
+
+### Test Scripts Overview
+
+We've consolidated all testing into two focused scripts for simplicity and maintainability:
+
+#### 1. test-models-comprehensive.sh - Complete Test Suite ⭐
+This is the main test script that covers everything: infrastructure verification, authentication, rate limiting, and model testing.
+
+**Features**:
+- Infrastructure verification (namespaces, deployments, API keys)
+- Token rate limiting component checks (EnvoyFilter, ConfigMap, Lua filter)
+- Authentication testing (with/without API keys)
+- Token-based rate limiting validation for all tiers
+- Model functionality tests for both Simulator and Qwen
+- Cross-tier isolation verification
+
+**The 10 Core Tests**:
+| Test # | Model     | Scenario                              | Expected Result          |
+|--------|-----------|---------------------------------------|--------------------------|
+| 1      | Simulator | WITH Authentication                   | ✅ Success (200)        |
+| 2      | Simulator | WITHOUT Authentication                | ❌ Fail (401)           |
+| 3      | Qwen      | WITH Authentication                   | ✅ Success (200)        |
+| 4      | Qwen      | WITHOUT Authentication                | ❌ Fail (401)           |
+| 5      | Simulator | FREE Tier Rate Limiting (200 tokens) | 🛑 Limited at ~180      |
+| 6      | Simulator | PREMIUM Tier (1000 tokens)           | ✅ Pass 10 requests     |
+| 7      | Simulator | ENTERPRISE Tier (5000 tokens)        | ✅ Pass 20 requests     |
+| 8      | Qwen      | FREE Tier Rate Limiting (200 tokens) | 🛑 Limited at ~180      |
+| 9      | Qwen      | PREMIUM Tier (1000 tokens)           | ✅ Pass 10 requests     |
+| 10     | Qwen      | ENTERPRISE Tier (5000 tokens)        | ✅ Pass 15 requests     |
+
+**Usage**:
+```bash
+# Full test with infrastructure verification
+./test-models-comprehensive.sh
+
+# Skip infrastructure checks for faster testing
+./test-models-comprehensive.sh --skip-infra
+
+# Skip 60-second wait between tests
+./test-models-comprehensive.sh --no-wait
+
+# Verbose output for debugging
+./test-models-comprehensive.sh --verbose
+```
+
+#### 2. verify-install.sh - Quick Installation Check
+A lightweight script for rapid installation verification.
+
+**Checks**:
+- Core namespaces (llm, istio-system, kuadrant-system)
+- Essential deployments (Authorino, Gateway)
+- Model deployments (Simulator, Qwen)
+- API key secrets (free, premium, enterprise)
+- Token rate limiting configuration
+
+**Usage**:
+```bash
+# Quick verification (takes seconds)
+./verify-install.sh
+```
+
+### Removed Scripts
+The following scripts were removed as their functionality is now fully covered by the comprehensive test:
+- `test-maas-complete.sh` - Merged into test-models-comprehensive.sh
+- `test-token-limits.sh` - Token testing integrated into main suite
+- `verify-token-install.sh` - Replaced by simpler verify-install.sh
+- `test-qwen-auth.sh` - Qwen tests integrated into main suite
+
+### API Keys Configuration
+
+| Tier       | API Keys                              | Token Limit/min | Request Limit/2min |
+|------------|---------------------------------------|-----------------|-------------------|
+| Free       | freeuser1_key, freeuser2_key         | 200            | 5                 |
+| Premium    | premiumuser1_key, premiumuser2_key   | 1,000          | 20                |
+| Enterprise | enterpriseuser1_key                   | 5,000          | 100               |
+
+### Test Script Improvements
+
+#### Fixed Issues
+1. **Test Counting Bug**: Infrastructure checks were incorrectly incrementing test counters
+2. **Debug Output Interference**: Fixed by redirecting debug messages to stderr
+3. **Arithmetic Operations**: Fixed bash operations for `set -e` compatibility
+4. **Token Counting Regex**: Updated to handle JSON with spaces
+5. **Rate Limit Exhaustion**: Added automatic detection and wait for reset
+6. **Qwen Pod Detection**: Fixed to handle multiple pods correctly
+
+## Model Configuration Details
+
+### Simulator Model
+- **Fixed Token Count**: Always returns 30 tokens per request
+- **Purpose**: Testing and validation
+- **No GPU Required**: Runs on CPU nodes
+
+### Qwen3 Model (GPU-Optimized)
+- **Actual Token Counting**: Returns real token usage based on input/output
+- **GPU Required**: Needs NVIDIA GPU with 16Gi+ memory
+- **Optimizations**:
+  - Token counting enabled (`RETURN_TOKEN_COUNTS=true`)
+  - GPU utilization set to 85%
+  - Max sequence length: 4096 (reduced for T4 stability)
+  - Batch size: 32 (optimized for T4)
+  - Uses xFormers attention backend for T4 compatibility
+
+### T4 GPU Specific Configuration
+Due to Triton compilation issues on Tesla T4 GPUs, the following workarounds are applied:
+- Use stable vLLM version (v0.6.2)
+- Disable Triton kernels
+- Use xFormers backend
+- Enable eager mode
+- Reduce memory limits
+
+## Troubleshooting Guide
+
+### Common Issues and Solutions
+
+#### Rate Limits Exhausted
+**Problem**: Tests fail immediately with 429 status
+**Solution**: Wait 60 seconds or use `--skip-wait` flag
+```bash
+# Check current status
+curl -k -X POST https://simulator-route-llm.apps.$DOMAIN/v1/chat/completions \
+  -H "Authorization: APIKEY premiumuser1_key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"simulator-model","messages":[{"role":"user","content":"Test"}]}' \
+  -w "\nHTTP: %{http_code}\n"
+```
+
+#### Enterprise Tier Not Working
+**Problem**: Enterprise API key returns 401
+**Solution**: Ensure secret exists and restart Authorino
+```bash
+kubectl get secret enterpriseuser1-apikey -n llm
+kubectl rollout restart deployment/authorino -n kuadrant-system
+```
+
+#### Token Headers Not Visible
+**Problem**: Response doesn't include token rate limit headers
+**Solution**: Restart gateway to load EnvoyFilter
+```bash
+kubectl rollout restart deployment/inference-gateway-istio -n istio-system
+```
+
+#### Qwen Pod Status Unknown
+**Problem**: Multiple Qwen pods with different statuses
+**Solution**: Script now correctly identifies Running pods with 1/1 ready status
+
+## Quick Reference Commands
+
+### Check System Status
+```bash
+# View all API keys
+kubectl get secrets -n llm | grep apikey
+
+# Check token rate limits
+kubectl get configmap token-rate-limits -n istio-system -o yaml
+
+# View EnvoyFilter
+kubectl get envoyfilter token-rate-limit-filter -n istio-system -o yaml
+
+# Check model pods
+kubectl get pods -n llm
+```
+
+### Test Specific Tiers
+```bash
+# Test Free Tier
+curl -k -X POST https://simulator-route-llm.apps.$DOMAIN/v1/chat/completions \
+  -H "Authorization: APIKEY freeuser1_key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"simulator-model","messages":[{"role":"user","content":"Test"}]}'
+
+# Test Premium Tier
+curl -k -X POST https://simulator-route-llm.apps.$DOMAIN/v1/chat/completions \
+  -H "Authorization: APIKEY premiumuser1_key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"simulator-model","messages":[{"role":"user","content":"Test"}]}'
+
+# Test Enterprise Tier
+curl -k -X POST https://simulator-route-llm.apps.$DOMAIN/v1/chat/completions \
+  -H "Authorization: APIKEY enterpriseuser1_key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"simulator-model","messages":[{"role":"user","content":"Test"}]}'
+```
+
+## Future Enhancements
+- Redis integration for distributed token counting
+- Dynamic tier configuration via ConfigMap
+- Prometheus metrics for token usage monitoring
+- Billing system integration based on token consumption
+- Support for multiple models with different token multipliers
+- WebSocket support for streaming responses with token counting

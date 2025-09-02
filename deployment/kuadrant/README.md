@@ -7,17 +7,18 @@ This repository demonstrates how to deploy a Models-as-a-Service platform using 
 **Gateway:** API Gateway + Istio/Envoy with Kuadrant policies integrated
 **Models:** KServe InferenceServices (Granite, Mistral, Nomic, Qwen, Simulator)
 **Authentication:** API Keys (simple) or Keycloak (Red Hat SSO)
-**Rate Limiting:** Kuadrant RateLimitPolicy
+**Rate Limiting:** Token-based (via EnvoyFilter) or Request-based (via Kuadrant RateLimitPolicy)
 **Observability:** Prometheus + Kuadrant Scrapes (for Kuadrant chargeback WIP see [Question on mapping authorized_calls metrics to a user](https://github.com/Kuadrant/limitador/issues/434))
 
 ### Key Components
 
 - **Istio Service Mesh**: Provides the data plane for traffic management
 - **Kuadrant Operator**: Manages API policies and traffic control
-- **Limitador**: Rate limiting service with Redis backend
+- **Limitador**: Rate limiting service with Redis backend (for request-based limits)
 - **Authorino**: Authentication and authorization service
 - **Gateway API**: Standard Kubernetes API for ingress traffic
 - **KServe**: Model serving platform that creates model pods
+- **EnvoyFilter**: Custom Lua script for token-based rate limiting
 
 ## How Model Pods Get Created
 
@@ -54,41 +55,324 @@ This repository demonstrates how to deploy a Models-as-a-Service platform using 
 
 ## 🚀 Quick Start (Automated Installer)
 
+### Installation Options
+
+The `install.sh` script provides comprehensive deployment with these key flags:
+
+```bash
+# Core Model Deployment Flags
+--simulator           # Deploy vLLM simulator (no GPU required)
+--qwen3              # Deploy Qwen3-0.6B model (GPU required)
+--install-all-models # Deploy both simulator and Qwen3
+--deploy-kind        # Create a KIND cluster and deploy simulator
+
+# Feature Flags
+--token-rate-limit   # Enable token-based rate limiting (recommended)
+--check-gpu          # Verify GPU availability before deployment
+--skip-metrics       # Skip Prometheus observability deployment
+
+# Platform Flags
+--ocp                # Force OpenShift mode
+--no-ocp             # Force vanilla Kubernetes mode
+```
+
+### Quick Examples
+
 **For KIND clusters (no GPU):**
-
 ```bash
-cd ~/rhmaas/models-aas/deployment/kuadrant
-./install.sh --simulator
-```
-
-**For GPU clusters:**
-
-```bash
-cd ~/rhmaas/models-aas/deployment/kuadrant  
-./install.sh --qwen3
-```
-
-**More Examples**
-
-```bash
-git clone https://github.com/redhat-et/models-aas.git
 cd deployment/kuadrant
-./install.sh --simulator            # For testing without GPU
-./install.sh --qwen3                # For GPU clusters with real AI models
-./install.sh --install-all-models   # For deploying both the qwen (on a GPU) and Sim
-./install.sh --deploy-kind          # Deploy a Kind cluster with a model simulator
+./install.sh --simulator --token-rate-limit
+```
+
+**For GPU clusters with token-based rate limiting:**
+```bash
+cd deployment/kuadrant  
+./install.sh --qwen3 --check-gpu --token-rate-limit
+```
+
+**Deploy everything with enterprise features:**
+```bash
+./install.sh --install-all-models --token-rate-limit
 ```
 
 The installer will:
+- ✅ Auto-detect platform (OpenShift vs Kubernetes)
 - ✅ Deploy Istio + Gateway API + KServe + Kuadrant
-- ✅ Configure gateway-level authentication and rate limiting
-- ✅ Deploy your chosen model (simulator or Qwen3-0.6B)
-- ✅ Set up tiered API keys (Free/Premium/Enterprise)
-- ✅ Show you the port-forward and test commands
+- ✅ Configure gateway-level authentication
+- ✅ Set up token-based or request-based rate limiting
+- ✅ Deploy your chosen model(s)
+- ✅ Create API keys for all tiers (Free/Premium/Enterprise)
+- ✅ Show test commands and verify installation
 
-**After installation, run the port-forward command shown to access your API!**
+## 🔐 How Authentication Works
 
----
+### Architecture
+
+The authentication system uses **Kuadrant's Authorino** service to validate API keys at the gateway level before requests reach the models.
+
+```
+Client Request
+     ↓
+[Authorization: APIKEY freeuser1_key]
+     ↓
+Istio Gateway (ingress)
+     ↓
+Authorino (validates API key)
+     ↓
+[If valid] → Forward to Model
+[If invalid] → Return 401
+```
+
+### Components Involved
+
+1. **API Key Secrets** (`05-api-key-secrets.yaml`):
+   - Kubernetes secrets in the `llm` namespace
+   - Contains API keys for each tier (free/premium/enterprise)
+   - Labeled with `kuadrant.io/auth-secret: "true"`
+
+2. **Authorino Deployment** (in `kuadrant-system` namespace):
+   - Validates incoming API keys
+   - Checks against stored secrets
+   - Extracts user metadata (tier, user ID)
+
+3. **AuthPolicy** (`06-auth-policies-apikey.yaml`):
+   - Defines authentication rules for the gateway
+   - Maps API keys to user identities
+   - Configures response headers with user info
+
+### API Key Tiers
+
+| Tier | API Keys | Purpose |
+|------|----------|---------|
+| **Free** | `freeuser1_key`, `freeuser2_key` | Basic access, lowest limits |
+| **Premium** | `premiumuser1_key`, `premiumuser2_key` | Enhanced access, higher limits |
+| **Enterprise** | `enterpriseuser1_key` | Highest access, maximum limits |
+
+## 📊 How Token-Based Rate Limiting Works
+
+### Overview
+
+Token-based rate limiting is more sophisticated than request counting—it tracks actual model usage based on input/output tokens, providing fair usage control for LLM services.
+
+### Architecture
+
+```
+Request with API Key
+     ↓
+EnvoyFilter (Lua Script)
+     ↓
+1. Extract API key
+2. Map to tier (free/premium/enterprise)
+3. Check current usage in shared memory
+4. [If under limit] → Forward request
+   [If over limit] → Return 429
+     ↓
+Model processes request
+     ↓
+Response with token usage
+     ↓
+EnvoyFilter (Lua Script)
+     ↓
+1. Extract token count from response
+2. Update usage in shared memory
+3. Add rate limit headers
+     ↓
+Response to client
+```
+
+### Components and Services
+
+1. **EnvoyFilter** (`08-token-rate-limit-envoyfilter.yaml`):
+   - Deployed in `istio-system` namespace
+   - Injects Lua script into gateway pods
+   - Intercepts all `/v1/chat/completions` requests
+
+2. **Lua Script Processing**:
+   ```lua
+   -- Request phase: Check if user has tokens available
+   local token_limits = {
+     free = 200,        -- 200 tokens/minute
+     premium = 1000,    -- 1000 tokens/minute
+     enterprise = 5000  -- 5000 tokens/minute
+   }
+   
+   -- Response phase: Count and track token usage
+   -- Parse: "usage":{"total_tokens":30}
+   -- Store: tokens:API_KEY:YYYYMMDDHHMM → current_usage
+   ```
+
+3. **Envoy Shared Data Store**:
+   - In-memory storage within each gateway pod
+   - Tracks usage with keys like `tokens:freeuser1_key:202409021545`
+   - 60-second TTL for automatic reset
+
+4. **Model Token Reporting**:
+   - **Simulator**: Fixed 30 tokens per request
+   - **Qwen**: Actual token counts via `RETURN_TOKEN_COUNTS=true`
+   - **Fallback**: Estimates ~4 characters per token
+
+### Rate Limit Tiers
+
+| Tier | Tokens/Minute | Tokens/Hour* | Tokens/Day* | Typical Requests |
+|------|--------------|-------------|-------------|-----------------|
+| **Free** | 200 | 5,000 | 50,000 | ~6-7 requests |
+| **Premium** | 1,000 | 30,000 | 500,000 | ~30-35 requests |
+| **Enterprise** | 5,000 | 150,000 | 2,000,000 | ~150-170 requests |
+
+*Hour/day limits defined but not currently enforced
+
+### Response Headers
+
+Every response includes rate limit information:
+```
+x-ratelimit-limit-tokens: 1000       # User's tier limit
+x-ratelimit-consumed-tokens: 45      # Tokens used in this request
+x-ratelimit-remaining-tokens: 955    # Tokens left in current minute
+```
+
+### How Token Counting Works
+
+1. **Request Interception**: EnvoyFilter intercepts all model requests
+2. **API Key Extraction**: Lua extracts key from `Authorization: APIKEY xxx`
+3. **Tier Mapping**: Maps API key to user tier
+4. **Usage Check**: Verifies tokens available in current minute window
+5. **Model Processing**: Request forwarded to model if under limit
+6. **Token Extraction**: Parses `usage.total_tokens` from response
+7. **Usage Update**: Updates shared memory with new total
+8. **Header Injection**: Adds rate limit info to response
+
+### Deployment
+
+When you run `./install.sh --token-rate-limit`:
+1. Applies EnvoyFilter to `istio-system` namespace
+2. **Restarts gateway deployments** to inject Lua filter
+3. ConfigMap with limits created for future customization
+4. Filter becomes active immediately
+
+### Token-Based vs Request-Based Comparison
+
+| Aspect | Token-Based | Request-Based |
+|--------|------------|---------------|
+| **Fairness** | ✅ Accounts for actual usage | ❌ All requests treated equally |
+| **Granularity** | ✅ Precise token counting | ❌ Simple request counting |
+| **Complexity** | Higher (Lua scripting) | Lower (native Kuadrant) |
+| **Performance** | Fast (in-memory) | Fast (Redis-backed) |
+| **Distribution** | Per-pod tracking | Centralized in Limitador |
+| **Use Case** | LLM services | Traditional APIs |
+
+### Current Limitations
+
+- **Not Distributed**: Each gateway pod tracks usage independently (multiple pods = multiple rate limit buckets)
+- **Memory-Based**: Usage data lost on pod restart
+- **Fixed Tiers**: Adding new tiers requires updating the EnvoyFilter
+- **No Persistence**: No historical usage tracking for billing/analytics
+
+## 🧪 Testing the Installation
+
+### Quick Verification
+
+After installation, verify the system:
+
+```bash
+# Quick installation check
+./verify-install.sh
+
+# Comprehensive testing (all models, auth, rate limits)
+./test-models-comprehensive.sh
+```
+
+### Manual Testing
+
+**Test Authentication (should fail without API key):**
+```bash
+curl -X POST https://simulator-route-llm.apps.$DOMAIN/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"simulator-model","messages":[{"role":"user","content":"Test"}]}'
+# Expected: 401 Unauthorized
+```
+
+**Test with API Key (Free Tier):**
+```bash
+curl -X POST https://simulator-route-llm.apps.$DOMAIN/v1/chat/completions \
+  -H 'Authorization: APIKEY freeuser1_key' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"simulator-model","messages":[{"role":"user","content":"Hello"}]}'
+# Expected: 200 OK with response
+```
+
+**Test Token Rate Limiting:**
+```bash
+# Free tier: 200 tokens/minute (~6-7 requests)
+for i in {1..10}; do
+  echo "Request $i:"
+  curl -s -o /dev/null -w "Status: %{http_code}\n" \
+    -X POST https://simulator-route-llm.apps.$DOMAIN/v1/chat/completions \
+    -H 'Authorization: APIKEY freeuser1_key' \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"simulator-model","messages":[{"role":"user","content":"Test"}]}'
+done
+# Expected: First ~6 requests succeed (200), then 429 (rate limited)
+```
+
+**Check Rate Limit Headers:**
+```bash
+curl -i -X POST https://simulator-route-llm.apps.$DOMAIN/v1/chat/completions \
+  -H 'Authorization: APIKEY premiumuser1_key' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"simulator-model","messages":[{"role":"user","content":"Test"}]}' \
+  2>/dev/null | grep x-ratelimit
+
+# Expected headers:
+# x-ratelimit-limit-tokens: 1000
+# x-ratelimit-consumed-tokens: 30
+# x-ratelimit-remaining-tokens: 970
+```
+
+## 📈 Monitoring and Observability
+
+Token usage and rate limiting can be monitored through:
+
+1. **Response Headers**: Real-time token consumption per request
+2. **Gateway Logs**: Lua script logs token usage details
+3. **Prometheus Metrics**: Limitador metrics for request-based limits
+4. **Custom Dashboards**: Track token usage patterns over time
+
+```bash
+# View gateway logs with token counting
+kubectl logs -n istio-system deployment/inference-gateway-istio -c istio-proxy | grep "Token"
+
+# View Authorino logs for auth events  
+kubectl logs -n kuadrant-system deployment/authorino | grep "auth"
+```
+
+## 🔧 Customization
+
+### Adjusting Token Limits
+
+Edit the EnvoyFilter to modify token limits:
+
+```bash
+# Edit the Lua script in 08-token-rate-limit-envoyfilter.yaml
+local token_limits = {
+  free = 500,        -- Increase free tier
+  premium = 2000,    -- Increase premium tier
+  enterprise = 10000 -- Increase enterprise tier
+}
+
+# Apply changes
+kubectl apply -f 08-token-rate-limit-envoyfilter.yaml
+
+# Restart gateway to apply
+kubectl rollout restart deployment/inference-gateway-istio -n istio-system
+```
+
+### Adding New API Keys
+
+```bash
+# Add new user to 05-api-key-secrets.yaml
+# Update user_tiers mapping in 08-token-rate-limit-envoyfilter.yaml
+# Apply both files and restart gateway
+```
 
 ## Manual Deployment (Advanced)
 
@@ -352,16 +636,22 @@ kubectl apply -f ../model_serving/vllm-simulator-kserve.yaml
 Deploy API key secrets, auth policies, and rate limiting:
 
 ```bash
-# Create API key secrets
+# Create API key secrets (includes enterprise tier)
 kubectl apply -f 05-api-key-secrets.yaml
 
 # Apply API key-based auth policies
 kubectl apply -f 06-auth-policies-apikey.yaml
 
-# Apply rate limiting policies
+# Choose your rate limiting approach:
+
+# Option A: Token-based rate limiting (recommended for LLMs)
+kubectl apply -f 08-token-rate-limit-envoyfilter.yaml
+kubectl rollout restart deployment/inference-gateway-istio -n istio-system
+
+# Option B: Request-based rate limiting (traditional)
 kubectl apply -f 07-rate-limit-policies.yaml
 
-# Kick the kuadrant controller if you dont see a limitador-limitador deployment or no rate-limiting
+# Restart Kuadrant controller to ensure policies are applied
 kubectl rollout restart deployment kuadrant-operator-controller-manager -n kuadrant-system
 ```
 
@@ -492,10 +782,11 @@ done
 
 **Available API Keys and Rate Limits:**
 
-| Tier | API Keys | Rate Limits (per 2min) |
-|------|----------|------------------------|
-| **Free** | `freeuser1_key`, `freeuser2_key` | 5 requests |
-| **Premium** | `premiumuser1_key`, `premiumuser2_key` | 20 requests |
+| Tier | API Keys | Token Limits/min | Request Limits/2min |
+|------|----------|-----------------|-------------------|
+| **Free** | `freeuser1_key`, `freeuser2_key` | 200 tokens | 5 requests |
+| **Premium** | `premiumuser1_key`, `premiumuser2_key` | 1,000 tokens | 20 requests |
+| **Enterprise** | `enterpriseuser1_key` | 5,000 tokens | 100 requests |
 
 - Expected Responses
 
@@ -614,6 +905,9 @@ kubectl logs -n kuadrant-system deployment/authorino
 
 - **502 Bad Gateway**: Check if model services are running and healthy
 - **No Rate Limiting or Auth**: Kick the kuadrant-operator-controller-manager
+- **Token headers not visible**: Ensure gateway was restarted after applying EnvoyFilter
+- **Rate limits not enforcing**: Check if `--token-rate-limit` flag was used during installation
+- **429 errors immediately**: Token limits reset every 60 seconds, wait for window to reset
 
 ### Openshift Troubleshooting
 
@@ -625,14 +919,31 @@ kubectl logs -n kuadrant-system deployment/authorino
 
 ### Adjusting Rate Limits
 
-Edit the RateLimitPolicy resources in `06-rate-limit-policies.yaml`:
+**For Token-Based Limits:**
 
+Edit the EnvoyFilter in `08-token-rate-limit-envoyfilter.yaml`:
+```lua
+local token_limits = {
+  free = 500,        -- Increase from 200
+  premium = 2000,    -- Increase from 1000
+  enterprise = 10000 -- Increase from 5000
+}
+```
+Then restart the gateway:
+```bash
+kubectl apply -f 08-token-rate-limit-envoyfilter.yaml
+kubectl rollout restart deployment/inference-gateway-istio -n istio-system
+```
+
+**For Request-Based Limits:**
+
+Edit the RateLimitPolicy resources in `07-rate-limit-policies.yaml`:
 ```yaml
 limits:
-  "requests-per-minute":
+  "requests-per-2min":
     rates:
       - limit: 150  # Increase from 100
-        duration: 1m
+        duration: 2m
         unit: request
 ```
 
