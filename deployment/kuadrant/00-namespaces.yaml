@@ -19,3 +19,10 @@ metadata:
   name: llm-observability
   labels:
     istio-injection: enabled
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: minio-system
+  labels:
+    istio-injection: disabled

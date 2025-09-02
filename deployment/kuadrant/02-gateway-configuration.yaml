@@ -9,6 +9,6 @@ spec:
   gatewayClassName: istio
   listeners:
     - name: http
-      hostname: "*.apps.summit-gpu.octo-emerging.redhataicoe.com"
+      hostname: "*.maas.local"
       port: 80
       protocol: HTTP

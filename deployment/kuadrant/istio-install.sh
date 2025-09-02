@@ -11,7 +11,7 @@
 set -e
 
 MODE=${1:-apply}
-TAG=1.26.2
+TAG=1.26.3
 HUB=gcr.io/istio-release
 OCP=false
 
@@ -27,7 +27,7 @@ echo "vLLM namespace: $VLLM_NAMESPACE"
 echo "Observability namespace: $OBSERVABILITY_NAMESPACE"
 if [[ "$OCP" == true ]]; then
     echo "Skipping Istio installation on OCP..."
-    return
+    exit 0
 fi
 
 if [[ "$MODE" == "apply" ]]; then
@@ -36,6 +36,28 @@ if [[ "$MODE" == "apply" ]]; then
     # Install Gateway API CRDs first
     echo "Installing Gateway API CRDs..."
     kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.3.0/standard-install.yaml
+
+    # Check for existing Istio resources from Service Mesh or other sources
+    echo "Checking for existing Istio resources..."
+    if kubectl get serviceaccount istio-reader-service-account -n istio-system &>/dev/null; then
+        echo "Found existing Istio resources. Checking if they're from Service Mesh operator..."
+        
+        # Check if resources are owned by Service Mesh operator
+        if kubectl get serviceaccount istio-reader-service-account -n istio-system -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-namespace}' 2>/dev/null | grep -q "openshift-operators"; then
+            echo "❌ ERROR: Existing Istio resources are managed by OpenShift Service Mesh operator!"
+            echo "Please either:"
+            echo "  1. Run this script with OCP=true environment variable"
+            echo "  2. Use the install.sh script with --ocp flag"
+            echo "  3. Manually clean up Service Mesh resources if you want to use vanilla Istio"
+            exit 1
+        fi
+        
+        # Try to clean up existing Helm releases
+        echo "Cleaning up existing Istio Helm releases..."
+        helm uninstall istiod -n istio-system --ignore-not-found 2>/dev/null || true
+        helm uninstall istio-base -n istio-system --ignore-not-found 2>/dev/null || true
+        sleep 5
+    fi
 
     # Install Istio base
     echo "Installing Istio base..."

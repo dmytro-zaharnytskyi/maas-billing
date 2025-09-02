@@ -1,0 +1,160 @@
+---
+# Qwen3-0.6B Model serving with vLLM - GPU Optimized
+# Fixed version that works with KServe by not using storageUri
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  annotations:
+    openshift.io/display-name: Qwen3-0.6B-Instruct-GPU
+    serving.kserve.io/deploymentMode: RawDeployment
+    sidecar.istio.io/inject: "false"  # Disable sidecar for better performance
+  name: qwen3-0-6b-instruct
+  namespace: llm
+  labels:
+    opendatahub.io/dashboard: 'true'
+    tier: "gpu"
+spec:
+  predictor:
+    maxReplicas: 1
+    minReplicas: 1
+    serviceAccountName: default
+    # GPU node selector
+    nodeSelector:
+      nvidia.com/gpu.present: "true"
+    tolerations:
+      - effect: NoSchedule
+        key: nvidia.com/gpu
+        operator: Exists
+    containers:
+    - name: kserve-container
+      image: vllm/vllm-openai:v0.6.2  # Using stable version known to work with T4
+      args:
+        - --port=8080
+        - --model=Qwen/Qwen2.5-0.5B-Instruct
+        - --served-model-name=qwen3-0-6b-instruct
+        - --distributed-executor-backend=mp
+        - --max-model-len=4096  # Reduced from 8192 for stability
+        - --trust-remote-code
+        - --gpu-memory-utilization=0.85
+        - --max-num-seqs=32  # Reduced from 64 for stability
+        - --dtype=float16  # Explicit dtype for T4
+        - --enforce-eager  # Disable CUDA graphs to avoid Triton compilation issues
+        # Removed --enable-prefix-caching as it can cause issues with Triton
+      env:
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: huggingface-token
+              key: token
+              optional: true
+        # Disable Triton attention kernel which causes compilation errors on T4
+        - name: VLLM_USE_TRITON_ATTENTION
+          value: "0"
+        # Use xFormers backend instead of Triton
+        - name: VLLM_ATTENTION_BACKEND
+          value: "XFORMERS"
+        # Disable Triton Flash Attention
+        - name: VLLM_USE_TRITON_FLASH_ATTN
+          value: "0"
+        # Basic cache directories
+        - name: HOME
+          value: /tmp
+        - name: XDG_CACHE_HOME
+          value: /tmp/.cache
+        - name: VLLM_CACHE_ROOT
+          value: /tmp/vllm_cache
+        - name: HF_HOME
+          value: /tmp/hf_home
+        - name: TRANSFORMERS_CACHE
+          value: /tmp/transformers_cache
+        - name: RETURN_TOKEN_COUNTS
+          value: "true"
+        - name: LOG_STATS
+          value: "true"
+        - name: GPU_MEMORY_UTILIZATION
+          value: "0.85"
+        - name: MAX_MODEL_LEN
+          value: "8192"
+        - name: MAX_NUM_SEQS
+          value: "32"
+        - name: VLLM_WORKER_MULTIPROC_METHOD
+          value: spawn
+        - name: PYTORCH_CUDA_ALLOC_CONF
+          value: max_split_size_mb:512
+        # Disable NCCL P2P for stability on T4
+        - name: NCCL_P2P_DISABLE
+          value: "1"
+        # Additional logging to debug issues
+        - name: VLLM_LOGGING_LEVEL
+          value: "INFO"
+      ports:
+        - containerPort: 8080
+          protocol: TCP
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        initialDelaySeconds: 60  # Increased for model loading
+        periodSeconds: 10
+        timeoutSeconds: 5
+        successThreshold: 1
+        failureThreshold: 5
+      livenessProbe:
+        httpGet:
+          path: /health
+          port: 8080
+        initialDelaySeconds: 120  # Increased for model loading
+        periodSeconds: 30
+        timeoutSeconds: 5
+        successThreshold: 1
+        failureThreshold: 3
+      resources:
+        limits:
+          cpu: "4"
+          memory: 16Gi
+          nvidia.com/gpu: "1"
+        requests:
+          cpu: "2"
+          memory: 8Gi
+          nvidia.com/gpu: "1"
+      volumeMounts:
+        - name: shm
+          mountPath: /dev/shm
+        - name: tmp
+          mountPath: /tmp
+        - name: cache
+          mountPath: /root/.cache
+    volumes:
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 4Gi
+      - name: tmp
+        emptyDir:
+          sizeLimit: 10Gi
+      - name: cache
+        emptyDir:
+          sizeLimit: 20Gi
+---
+# HTTPRoute for Qwen model - domain-based routing
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: qwen3-route
+  namespace: llm
+spec:
+  parentRefs:
+  - name: inference-gateway
+    namespace: istio-system
+  hostnames:
+  - "qwen3.maas.local"
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: qwen3-0-6b-instruct-gateway-svc  # Will be created by the script
+      port: 80 

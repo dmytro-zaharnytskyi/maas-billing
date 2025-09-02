@@ -1,0 +1,238 @@
+---
+# Token-based Rate Limiting EnvoyFilter
+# This filter counts tokens in LLM responses and enforces per-minute token limits
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: token-rate-limit-filter
+  namespace: istio-system
+spec:
+  configPatches:
+  # Add Lua script for token counting
+  - applyTo: HTTP_FILTER
+    match:
+      context: GATEWAY
+      listener:
+        filterChain:
+          filter:
+            name: "envoy.filters.network.http_connection_manager"
+            subFilter:
+              name: "envoy.filters.http.router"
+    patch:
+      operation: INSERT_BEFORE
+      value:
+        name: envoy.filters.http.lua
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+          inline_code: |
+            -- Token counting and rate limiting logic
+            function envoy_on_request(request_handle)
+              -- Get user identity from auth headers
+              local auth_header = request_handle:headers():get("x-auth-userid")
+              local user_group = request_handle:headers():get("x-auth-groups")
+              
+              if auth_header == nil then
+                return
+              end
+              
+              -- Define token limits per minute based on user tier
+              local token_limits = {
+                free = 200,      -- 200 tokens per minute
+                premium = 1000,  -- 1000 tokens per minute
+                enterprise = 5000 -- 5000 tokens per minute
+              }
+              
+              -- Get user's tier
+              local user_tier = "free"  -- default
+              if user_group ~= nil then
+                if string.find(user_group, "premium") then
+                  user_tier = "premium"
+                elseif string.find(user_group, "enterprise") then
+                  user_tier = "enterprise"
+                end
+              end
+              
+              -- Store user info for response processing
+              request_handle:headers():add("x-user-tier", user_tier)
+              request_handle:headers():add("x-token-limit", tostring(token_limits[user_tier]))
+              
+              -- Check current token usage from shared data
+              local key = "tokens:" .. auth_header
+              local current_minute = os.date("%Y%m%d%H%M")
+              local usage_key = key .. ":" .. current_minute
+              
+              local current_usage = request_handle:sharedData():get(usage_key)
+              if current_usage == nil then
+                current_usage = 0
+              else
+                current_usage = tonumber(current_usage)
+              end
+              
+              -- Check if user has exceeded limit
+              if current_usage >= token_limits[user_tier] then
+                request_handle:respond(
+                  {[":status"] = "429"},
+                  '{"error": "Token rate limit exceeded", "limit": ' .. token_limits[user_tier] .. 
+                  ', "used": ' .. current_usage .. ', "reset_in_seconds": ' .. (60 - os.date("%S")) .. '}'
+                )
+              end
+            end
+            
+            function envoy_on_response(response_handle)
+              -- Extract token count from response
+              local body = response_handle:body()
+              if body == nil then
+                return
+              end
+              
+              local body_str = body:getBytes(0, body:length())
+              local auth_header = response_handle:headers():get("x-auth-userid")
+              local user_tier = response_handle:headers():get("x-user-tier")
+              
+              if auth_header == nil or user_tier == nil then
+                return
+              end
+              
+              -- Parse response to get token usage
+              -- vLLM returns usage in format: "usage":{"prompt_tokens":X,"completion_tokens":Y,"total_tokens":Z}
+              local total_tokens = 0
+              local usage_pattern = '"usage":%s*{[^}]*"total_tokens":%s*(%d+)'
+              local tokens = string.match(body_str, usage_pattern)
+              
+              if tokens ~= nil then
+                total_tokens = tonumber(tokens)
+              else
+                -- Fallback: estimate tokens (roughly 4 chars per token)
+                total_tokens = string.len(body_str) / 4
+              end
+              
+              -- Update token usage
+              local key = "tokens:" .. auth_header
+              local current_minute = os.date("%Y%m%d%H%M")
+              local usage_key = key .. ":" .. current_minute
+              
+              local current_usage = response_handle:sharedData():get(usage_key)
+              if current_usage == nil then
+                current_usage = 0
+              else
+                current_usage = tonumber(current_usage)
+              end
+              
+              current_usage = current_usage + total_tokens
+              response_handle:sharedData():set(usage_key, tostring(current_usage), 60) -- TTL 60 seconds
+              
+              -- Add headers with token information
+              response_handle:headers():add("x-tokens-used", tostring(total_tokens))
+              response_handle:headers():add("x-tokens-limit", response_handle:headers():get("x-token-limit"))
+              response_handle:headers():add("x-tokens-remaining", tostring(tonumber(response_handle:headers():get("x-token-limit")) - current_usage))
+            end
+---
+# Alternative implementation using WASM for better performance
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: token-rate-limit-wasm
+  namespace: istio-system
+spec:
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: GATEWAY
+      listener:
+        filterChain:
+          filter:
+            name: "envoy.filters.network.http_connection_manager"
+    patch:
+      operation: INSERT_BEFORE
+      value:
+        name: token-rate-limiter
+        typed_config:
+          "@type": type.googleapis.com/udpa.type.v1.TypedStruct
+          type_url: type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+          value:
+            config:
+              root_id: token_rate_limiter
+              vm_config:
+                vm_id: token_rate_limiter
+                runtime: "envoy.wasm.runtime.v8"
+                code:
+                  local:
+                    inline_string: |
+                      const rootContext = {
+                        onRequestHeaders() {
+                          const headers = this.request_headers;
+                          const userId = headers['x-auth-userid'];
+                          const userGroups = headers['x-auth-groups'] || '';
+                          
+                          if (!userId) return FilterHeadersStatus.Continue;
+                          
+                          // Determine user tier and limits
+                          let tokenLimit = 200; // default free tier
+                          if (userGroups.includes('premium')) {
+                            tokenLimit = 1000;
+                          } else if (userGroups.includes('enterprise')) {
+                            tokenLimit = 5000;
+                          }
+                          
+                          // Check token usage (simplified - real impl would use external store)
+                          const currentMinute = new Date().toISOString().slice(0, 16);
+                          const usageKey = `tokens:${userId}:${currentMinute}`;
+                          
+                          // Store for response processing
+                          this.setProperty(['user_id'], userId);
+                          this.setProperty(['token_limit'], tokenLimit);
+                          
+                          return FilterHeadersStatus.Continue;
+                        },
+                        
+                        onResponseBody() {
+                          const body = this.response_body;
+                          const userId = this.getProperty(['user_id']);
+                          const tokenLimit = this.getProperty(['token_limit']);
+                          
+                          if (!userId || !body) return FilterDataStatus.Continue;
+                          
+                          // Parse token usage from response
+                          try {
+                            const response = JSON.parse(body);
+                            const tokensUsed = response.usage?.total_tokens || 0;
+                            
+                            // Add response headers
+                            this.response_headers['x-tokens-used'] = tokensUsed.toString();
+                            this.response_headers['x-tokens-limit'] = tokenLimit.toString();
+                            
+                          } catch (e) {
+                            // Fallback to estimation
+                          }
+                          
+                          return FilterDataStatus.Continue;
+                        }
+                      };
+---
+# ConfigMap for token limits configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: token-rate-limits
+  namespace: istio-system
+data:
+  limits.yaml: |
+    tiers:
+      free:
+        tokens_per_minute: 200
+        tokens_per_hour: 5000
+        tokens_per_day: 50000
+      premium:
+        tokens_per_minute: 1000
+        tokens_per_hour: 30000
+        tokens_per_day: 500000
+      enterprise:
+        tokens_per_minute: 5000
+        tokens_per_hour: 150000
+        tokens_per_day: 2000000
+    
+    # Model-specific multipliers (some models cost more)
+    model_multipliers:
+      "qwen3-0-6b-instruct": 1.0
+      "llama-3-8b": 1.5
+      "mixtral-8x7b": 2.0 

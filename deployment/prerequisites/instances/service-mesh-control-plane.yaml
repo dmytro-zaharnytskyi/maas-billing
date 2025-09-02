@@ -1,0 +1,40 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: istio-system
+  annotations:
+    openshift.io/display-name: "Service Mesh System"
+---
+apiVersion: maistra.io/v2
+kind: ServiceMeshControlPlane
+metadata:
+  name: data-science-smcp
+  namespace: istio-system
+spec:
+  version: v2.6
+  mode: ClusterWide
+  techPreview:
+    gatewayAPI:
+      enabled: true
+  security:
+    dataPlane:
+      mtls: false
+  gateways:
+    ingress:
+      enabled: true
+      namespace: istio-system
+      service:
+        type: ClusterIP
+---
+apiVersion: maistra.io/v1
+kind: ServiceMeshMemberRoll
+metadata:
+  name: default
+  namespace: istio-system
+spec:
+  members:
+  - llm
+  - llm-observability
+  - kuadrant-system
+  - redhat-ods-applications 

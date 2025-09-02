@@ -1,0 +1,45 @@
+---
+apiVersion: nvidia.com/v1
+kind: ClusterPolicy
+metadata:
+  name: gpu-cluster-policy
+spec:
+  operator:
+    defaultRuntime: crio
+    use_ocp_driver_toolkit: true
+  driver:
+    enabled: true
+    version: "570.172.08"
+    useOpenKernelModules: false
+    licensingConfig:
+      nlsEnabled: false
+    certConfig:
+      name: ""
+    kernelModuleConfig:
+      name: ""
+  toolkit:
+    enabled: true
+    version: "1.17.8-ubi8"
+  devicePlugin:
+    enabled: true
+    version: "0.17.2-ubi8"
+  dcgm:
+    enabled: true
+    version: "4.2.3-4.1.3-ubi8"
+  dcgmExporter:
+    enabled: true
+    version: "4.2.3-4.1.3-ubi8"
+  nodeStatusExporter:
+    enabled: true
+    version: "25.3.1-ubi8"
+  gfd:
+    enabled: true
+    version: "0.17.2-ubi8"
+  migManager:
+    enabled: true
+    version: "0.12.1-ubi8"
+  validator:
+    plugin:
+      env:
+      - name: WITH_WORKLOAD
+        value: "true" 

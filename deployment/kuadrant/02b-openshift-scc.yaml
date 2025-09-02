@@ -18,9 +18,7 @@ allowHostPID: false
 allowHostPorts: false
 allowPrivilegedContainer: false
 allowPrivilegeEscalation: true
-allowedCapabilities:
-- NET_ADMIN
-- NET_RAW
+allowedCapabilities: []
 defaultAddCapabilities: null
 fsGroup:
   type: RunAsAny

@@ -1,9 +1,4 @@
-# deployment/kuadrant/02-kuadrant.yaml
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: kuadrant-system
----
+# Kuadrant instance - namespace created in 00-namespaces.yaml
 apiVersion: kuadrant.io/v1beta1
 kind: Kuadrant
 metadata:

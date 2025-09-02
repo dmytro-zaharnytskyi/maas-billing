@@ -1,9 +1,5 @@
 # MinIO for local S3-compatible storage in minikube
----
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: minio-system
+# Namespace created in 00-namespaces.yaml
 ---
 # PersistentVolumeClaim for MinIO data
 apiVersion: v1
