@@ -13,14 +13,14 @@ const (
 )
 
 type MetadataStore interface {
-	Add(ctx context.Context, namespace, username string, apiKey *APIKey) error
+	Add(ctx context.Context, username string, apiKey *APIKey) error
 
-	List(ctx context.Context, namespace, username string) ([]ApiKeyMetadata, error)
+	List(ctx context.Context, username string) ([]ApiKeyMetadata, error)
 
-	Get(ctx context.Context, namespace, username, jti string) (*ApiKeyMetadata, error)
+	Get(ctx context.Context, username, jti string) (*ApiKeyMetadata, error)
 
 	// InvalidateAll marks all active tokens for a user as expired.
-	InvalidateAll(ctx context.Context, namespace, username string) error
+	InvalidateAll(ctx context.Context, username string) error
 
 	Close() error
 }
