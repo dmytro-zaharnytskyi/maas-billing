@@ -9,3 +9,13 @@ resources:
   - ../odh
   - ../../base/policies/usage-policies
   - ../../base/observability
+
+patches:
+# Patch webhook to use redhat-ods-applications namespace for RHOAI deployments
+- patch: |-
+    - op: replace
+      path: /webhooks/0/clientConfig/service/namespace
+      value: redhat-ods-applications
+  target:
+    kind: ValidatingWebhookConfiguration
+    name: tier-configmap-validator.odh-model-controller.opendatahub.io

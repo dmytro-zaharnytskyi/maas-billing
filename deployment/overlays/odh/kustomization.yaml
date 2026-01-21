@@ -41,6 +41,14 @@ patches:
   target:
     kind: Deployment
     name: maas-api
+# Patch webhook to use opendatahub namespace for ODH deployments
+- patch: |-
+    - op: replace
+      path: /webhooks/0/clientConfig/service/namespace
+      value: opendatahub
+  target:
+    kind: ValidatingWebhookConfiguration
+    name: tier-configmap-validator.odh-model-controller.opendatahub.io
 
 replacements:
 - source:
