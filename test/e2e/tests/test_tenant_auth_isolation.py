@@ -29,7 +29,12 @@ from multitenancy_helpers import (
     tenant_internal_url,
     validate_api_key_at,
 )
-from test_helper import _delete_cr, _delete_governance_and_wait, _get_cluster_token
+from test_helper import (
+    _delete_cr,
+    _delete_governance_and_wait,
+    _get_cluster_token,
+    _wait_for_subscription_trlp_status,
+)
 
 pytestmark = pytest.mark.xdist_group("tenant_isolation")
 
@@ -289,6 +294,15 @@ class TestTenantAuthIsolation:
     def test_api_key_subscription_selection_uses_tenant_namespace(self, tenant_auth_setup, tenant_api_keys):
         """3.x/4.x: Internal subscription selection reports the tenant-local subscription namespace."""
         tenant_a = tenant_auth_setup["tenant_a"]
+        # The shared fixture skips enforcement readiness for API-key management.
+        # Selecting a model requires its tenant-local rate-limit policy to be ready.
+        _wait_for_subscription_trlp_status(
+            tenant_auth_setup["subscription"],
+            expected_ready=True,
+            namespace=tenant_a["namespace"],
+            model=tenant_a["model_name"],
+            timeout=120,
+        )
         response = select_subscription_at(
             tenant_internal_url(tenant_a["name"]),
             tenant_api_keys["a"]["key"],
