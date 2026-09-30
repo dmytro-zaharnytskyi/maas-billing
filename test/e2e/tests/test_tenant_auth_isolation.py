@@ -11,6 +11,7 @@ and validate API key isolation between tenants.
 """
 
 import os
+import time
 import uuid
 
 import pytest
@@ -303,15 +304,21 @@ class TestTenantAuthIsolation:
             model=tenant_a["model_name"],
             timeout=120,
         )
-        response = select_subscription_at(
-            tenant_internal_url(tenant_a["name"]),
-            tenant_api_keys["a"]["key"],
-            "e2e-auth-user",
-            ["system:authenticated"],
-            requested_subscription=tenant_auth_setup["subscription"],
-            requested_model=f"{tenant_a['model_namespace']}/{tenant_a['model_name']}",
-        )
-        assert response.status_code == 200
-        data = response.json()
+        # The selector's informer cache can lag behind the CR readiness above.
+        deadline = time.monotonic() + 60
+        while True:
+            response = select_subscription_at(
+                tenant_internal_url(tenant_a["name"]),
+                tenant_api_keys["a"]["key"],
+                "e2e-auth-user",
+                ["system:authenticated"],
+                requested_subscription=tenant_auth_setup["subscription"],
+                requested_model=f"{tenant_a['model_namespace']}/{tenant_a['model_name']}",
+            )
+            assert response.status_code == 200
+            data = response.json()
+            if data.get("error") != "model_unhealthy" or time.monotonic() >= deadline:
+                break
+            time.sleep(2)
         assert data.get("error") is None, redact_sensitive(data)
         assert data.get("namespace") == tenant_a["namespace"]
