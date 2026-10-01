@@ -18,6 +18,7 @@ import pytest
 import requests
 
 from multitenancy_helpers import (
+    MODEL_BACKEND_READY_TIMEOUT,
     create_api_key_at,
     get_api_key_at,
     list_subscriptions_at,
@@ -142,7 +143,7 @@ def tenant_auth_setup(tenant_env):
                 policy_name,
                 subscription_name,
                 gateway_name=tenant["gateway_name"],
-                require_trlp_ready=False,
+                trlp_timeout=MODEL_BACKEND_READY_TIMEOUT,
             )
         yield {
             "tenant_a": tenant_a,
