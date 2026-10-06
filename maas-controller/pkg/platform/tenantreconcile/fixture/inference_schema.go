@@ -30,16 +30,16 @@ func InferenceCRDs() ([]*apiextensionsv1.CustomResourceDefinition, error) {
 	return crds, nil
 }
 
-// InferenceSchemaContract pins AGC's generated RHOAIENG-90800 validation schema
-// at AGC commit 233179ce7bd11c7181e570388c72445eed8752ac. Refresh it from AGC's
-// generated schemas when synchronizing the CRDs.
-// Descriptions are omitted so documentation changes do not obscure API drift.
+// InferenceSchemaContract is the validation schema AGC generates under
+// config/crd/bases. Descriptions are omitted so documentation changes do not
+// obscure API drift. Regenerate it when synchronizing the CRDs; the command is in
+// ai-gateway-payload-processing's api/inference/v1alpha1/testdata/README.md.
 func InferenceSchemaContract() (map[string]apiextensionsv1.JSONSchemaProps, error) {
 	return inferenceSchemaFixture("agc-inference-schema.json")
 }
 
 // LegacyInferenceCRDs restores the validation baseline installed from MaaS
-// commit 353a85e841d8442afc976a539e49e2925b73e017, also pinned by AGC and IPP.
+// commit 353a85e841d8442afc976a539e49e2925b73e017, also used by AGC's schema tests.
 // Keep this fixture unchanged to test real upgrades from the old contract.
 func LegacyInferenceCRDs() ([]*apiextensionsv1.CustomResourceDefinition, error) {
 	crds, err := InferenceCRDs()

@@ -67,8 +67,6 @@ spec:
                       namespace. The Secret must contain a data key "api-key" with the credential value.
                     properties:
                       name:
-                        description: Retain the installed schema's accepted name pattern
-                          for compatibility.
                         maxLength: 253
                         minLength: 1
                         pattern: ^[a-z0-9]([a-z0-9.\-]*[a-z0-9])?$
