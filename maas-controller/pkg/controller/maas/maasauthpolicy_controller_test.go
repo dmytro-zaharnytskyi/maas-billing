@@ -1771,6 +1771,85 @@ func TestBuildGatewayAuthPolicySpec_K8sAuth(t *testing.T) {
 	}
 }
 
+func TestBuildGatewayAuthPolicySpec_ErrorResponses(t *testing.T) {
+	obj := gatewayAuthPolicySpecTestObject(t, nil)
+
+	t.Run("unauthenticated returns JSON body with 401", func(t *testing.T) {
+		unauthn := nestedMapRequired(t, obj, "spec", "defaults", "rules", "response", "unauthenticated")
+
+		code, ok := unauthn["code"].(int64)
+		if !ok || code != 401 {
+			t.Fatalf("unauthenticated code = %v, want 401", unauthn["code"])
+		}
+
+		bodyMap, ok := unauthn["body"].(map[string]any)
+		if !ok {
+			t.Fatal("unauthenticated must have a body map for JSON error response")
+		}
+		bodyVal, ok := bodyMap["value"].(string)
+		if !ok || bodyVal == "" {
+			t.Fatal("unauthenticated body.value must be a non-empty JSON string")
+		}
+		if !strings.Contains(bodyVal, `"authentication_error"`) {
+			t.Errorf("unauthenticated body should contain authentication_error type, got: %s", bodyVal)
+		}
+		if !strings.Contains(bodyVal, `"code":401`) {
+			t.Errorf("unauthenticated body should contain code 401, got: %s", bodyVal)
+		}
+
+		headers, ok := unauthn["headers"].(map[string]any)
+		if !ok {
+			t.Fatal("unauthenticated must have headers with content-type")
+		}
+		ct, ok := headers["content-type"].(map[string]any)
+		if !ok {
+			t.Fatal("unauthenticated headers must include content-type")
+		}
+		if ct["value"] != "application/json" {
+			t.Errorf("unauthenticated content-type = %v, want application/json", ct["value"])
+		}
+	})
+
+	t.Run("unauthorized returns JSON body with 403", func(t *testing.T) {
+		unauthz := nestedMapRequired(t, obj, "spec", "defaults", "rules", "response", "unauthorized")
+
+		code, ok := unauthz["code"].(int64)
+		if !ok || code != 403 {
+			t.Fatalf("unauthorized code = %v, want 403", unauthz["code"])
+		}
+
+		bodyMap, ok := unauthz["body"].(map[string]any)
+		if !ok {
+			t.Fatal("unauthorized must have a body map for JSON error response")
+		}
+		bodyExpr, ok := bodyMap["expression"].(string)
+		if !ok || bodyExpr == "" {
+			t.Fatal("unauthorized body.expression must be a non-empty CEL expression")
+		}
+		if !strings.Contains(bodyExpr, `"authorization_error"`) {
+			t.Errorf("unauthorized body should contain authorization_error type, got: %s", bodyExpr)
+		}
+		if !strings.Contains(bodyExpr, `"code":403`) {
+			t.Errorf("unauthorized body should contain code 403, got: %s", bodyExpr)
+		}
+		if !strings.Contains(bodyExpr, `.replace(`) {
+			t.Errorf("unauthorized body expression should JSON-escape the message with .replace(), got: %s", bodyExpr)
+		}
+
+		headers, ok := unauthz["headers"].(map[string]any)
+		if !ok {
+			t.Fatal("unauthorized must have headers")
+		}
+		ct, ok := headers["content-type"].(map[string]any)
+		if !ok {
+			t.Fatal("unauthorized headers must include content-type")
+		}
+		if ct["value"] != "application/json" {
+			t.Errorf("unauthorized content-type = %v, want application/json", ct["value"])
+		}
+	})
+}
+
 func TestBuildGatewayAuthPolicySpec_DenyClientIdentityHeaders(t *testing.T) {
 	obj := gatewayAuthPolicySpecTestObject(t, nil)
 
@@ -1808,6 +1887,34 @@ func TestBuildGatewayAuthPolicySpec_DenyClientIdentityHeaders(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("deny-client-identity-headers predicates = %#v, want %#v", got, want)
 		}
+	}
+}
+
+func TestBuildGatewayAuthPolicySpec_SubscriptionHeaderInjection(t *testing.T) {
+	obj := gatewayAuthPolicySpecTestObject(t, nil)
+
+	predicate := nestedWhenPredicateRequired(t, obj,
+		"spec", "defaults", "rules", "response", "success", "headers", "X-MaaS-Subscription", "when")
+	wantPredicate := `has(auth.metadata) && has(auth.metadata.apiKeyValidation) && auth.metadata.apiKeyValidation.subscription != ""`
+	if predicate != wantPredicate {
+		t.Errorf("subscription header must be injected only for API keys with a subscription: got %q, want %q", predicate, wantPredicate)
+	}
+
+	// User tokens still use the client header for subscription selection, without
+	// adding another copy of that header to the upstream request.
+	wantSelection := `(has(auth.metadata) && has(auth.metadata.apiKeyValidation)) ` +
+		`? auth.metadata.apiKeyValidation.subscription : ` +
+		`("x-maas-subscription" in request.headers ? request.headers["x-maas-subscription"] : "")`
+	body := nestedStringRequired(t, obj,
+		"spec", "defaults", "rules", "metadata", "subscription-info", "http", "body", "expression")
+	if !strings.Contains(body, `"requestedSubscription": `+wantSelection) {
+		t.Errorf("subscription-info must select the client header for user tokens, got body %q", body)
+	}
+
+	cacheKey := nestedStringRequired(t, obj,
+		"spec", "defaults", "rules", "metadata", "subscription-info", "cache", "key", "selector")
+	if !strings.Contains(cacheKey, wantSelection) {
+		t.Errorf("subscription-info cache key must include the client header selection, got %q", cacheKey)
 	}
 }
 
