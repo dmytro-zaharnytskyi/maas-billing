@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -103,6 +104,9 @@ type LifecycleReconciler struct {
 	DiscoveryLogLevel           string
 	DiscoveryNamespace          string
 	DiscoveryReplicas           *int32
+
+	staleResourcesCleanupMu        sync.Mutex
+	staleResourcesCleanupCompleted bool
 }
 
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;update;patch
@@ -158,6 +162,10 @@ func (r *LifecycleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			return ctrl.Result{}, err
 		} else if res != nil {
 			return *res, nil
+		}
+		// Upgrade cleanup is independent of observability and other module setup.
+		if err := r.cleanupStaleResources(ctx, log); err != nil {
+			return ctrl.Result{}, err
 		}
 		if err := r.ensureObservability(ctx, log); err != nil {
 			return ctrl.Result{}, err
