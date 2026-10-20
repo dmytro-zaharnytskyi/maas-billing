@@ -233,6 +233,11 @@ func (r *LifecycleReconciler) ensureDefaultAITenantReferencesConfig(ctx context.
 		}
 		return nil, err
 	}
+	if !aitenant.DeletionTimestamp.IsZero() || aitenant.Status.Phase == "Terminating" {
+		log.V(1).Info("skipping Config owner reference on terminating default AITenant",
+			"namespace", r.AITenantNamespace)
+		return nil, nil
+	}
 	if aitenantReferencesConfig(&aitenant, &cfg) {
 		return nil, nil
 	}
