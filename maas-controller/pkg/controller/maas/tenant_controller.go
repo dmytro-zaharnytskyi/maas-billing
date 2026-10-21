@@ -48,7 +48,10 @@ import (
 // The MaasTenantConfig CR is the runtime object; DSC.modelsAsService controls only enablement.
 type TenantReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	// APIReader bypasses the informer cache for migration safety decisions that
+	// must observe current ExternalModel and IPP ConfigMap state.
+	APIReader client.Reader
+	Scheme    *runtime.Scheme
 	// OperatorNamespace overrides POD_NAMESPACE / WATCH_NAMESPACE when discovering namespaced platform workloads (tests).
 	OperatorNamespace string
 	// ManifestPath is the directory containing kustomization.yaml for the ODH maas-api overlay (e.g. maas-api/deploy/overlays/odh).
@@ -309,6 +312,9 @@ func configResourceDefault() predicate.Predicate {
 // SetupWithManager registers the MaasTenantConfig controller.
 func (r *TenantReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	ctx := context.Background()
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
 
 	b := ctrl.NewControllerManagedBy(mgr).
 		For(&maasv1alpha1.MaasTenantConfig{}, builder.WithPredicates(
