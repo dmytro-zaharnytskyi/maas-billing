@@ -405,11 +405,15 @@ func legacyIPPTranslationModels(ctx context.Context, reader client.Reader, param
 
 // servedByTenant reports whether the tenant serves the model: from its own
 // namespace through its Gateway or, for the default tenant (non-nil
-// tenantNS), as a model without gatewayRefs outside tenant namespaces.
-// Malformed placement fails closed.
+// tenantNS), as a model without gatewayRefs outside tenant namespaces. The
+// shared AppNamespace is out of scope, as for IPP route cleanup. Malformed
+// placement fails closed.
 func servedByTenant(model *unstructured.Unstructured, namespace string, tenantNS sets.Set[string], params PlatformParams) bool {
 	if model.GetNamespace() == namespace {
 		return externalModelTargetsGateway(model, params)
+	}
+	if model.GetNamespace() == params.AppNamespace {
+		return false
 	}
 	refs, found, err := unstructured.NestedSlice(model.Object, "spec", "gatewayRefs")
 	return tenantNS != nil && !tenantNS.Has(model.GetNamespace()) && (err != nil || !found || len(refs) == 0)

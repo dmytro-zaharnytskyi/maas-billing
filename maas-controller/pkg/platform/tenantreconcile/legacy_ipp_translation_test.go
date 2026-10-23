@@ -113,11 +113,13 @@ func TestLegacyIPPTranslationModelsCoverDefaultTenantModelsOutsideTenantNamespac
 	objects = append(objects, implicit("llm", "openai-model", "openai")...)
 	objects = append(objects, implicit("tenant-b", "tenant-model", "azure")...)
 	objects = append(objects, implicit("claimed", "claimed-model", "azure")...)
+	objects = append(objects, implicit("redhat-ai-gateway-infra", "infra-model", "azure")...)
 	objects = append(objects, legacyTranslationModel("llm", "attached-model", "messages", "gateway-b", "gateway-ns", nil),
 		legacyTranslationProvider("llm", "attached-model-provider", "anthropic"))
 	cl := fake.NewClientBuilder().WithScheme(inferenceListScheme(t)).WithObjects(objects...).Build()
 
-	params := PlatformParams{ModelNamespace: "models-as-a-service", GatewayName: "maas-default-gateway", GatewayNamespace: "openshift-ingress"}
+	params := PlatformParams{ModelNamespace: "models-as-a-service", AppNamespace: "redhat-ai-gateway-infra",
+		GatewayName: "maas-default-gateway", GatewayNamespace: "openshift-ingress"}
 	got, err := legacyIPPTranslationModels(context.Background(), cl, params, &unstructured.Unstructured{})
 	require.NoError(t, err)
 	require.Equal(t, []string{"llm/azure-model (apiFormat=openai-chat, provider=azure)"}, got)
