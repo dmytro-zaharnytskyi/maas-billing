@@ -829,6 +829,7 @@ func cleanupIPPExternalModelRoutes(ctx context.Context, c client.Client, params 
 	routes := &unstructured.UnstructuredList{}
 	routes.SetGroupVersionKind(GVKHTTPRoute.GroupVersion().WithKind("HTTPRouteList"))
 	listOpts := []client.ListOption{client.MatchingLabels{"app.kubernetes.io/managed-by": ippExternalModelManagedBy}}
+	scope := "cluster-wide"
 	var tenantNS sets.Set[string]
 	if params.TenantIdentifier == "" {
 		var err error
@@ -837,9 +838,10 @@ func cleanupIPPExternalModelRoutes(ctx context.Context, c client.Client, params 
 		}
 	} else {
 		listOpts = append(listOpts, client.InNamespace(params.ModelNamespace))
+		scope = "in " + params.ModelNamespace
 	}
 	if err := c.List(ctx, routes, listOpts...); err != nil {
-		return fmt.Errorf("list existing IPP HTTPRoutes for %s: %w", params.ModelNamespace, err)
+		return fmt.Errorf("list existing IPP HTTPRoutes %s: %w", scope, err)
 	}
 	for i := range routes.Items {
 		route := &routes.Items[i]

@@ -315,16 +315,17 @@ func legacyIPPTranslationModels(ctx context.Context, reader client.Reader, param
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(schema.GroupVersionKind{Group: "inference.opendatahub.io", Version: "v1alpha1", Kind: "ExternalModelList"})
 	listOpts := []client.ListOption{client.InNamespace(namespace)}
+	scope := "in " + namespace
 	var tenantNS sets.Set[string]
 	if params.TenantIdentifier == "" {
 		var err error
 		if tenantNS, err = tenantNamespaces(ctx, reader); err != nil {
 			return nil, fmt.Errorf("assess legacy IPP translation compatibility: %w", err)
 		}
-		listOpts = nil
+		listOpts, scope = nil, "cluster-wide"
 	}
 	if err := reader.List(ctx, list, listOpts...); err != nil {
-		return nil, fmt.Errorf("list ExternalModels in %s for legacy IPP translation compatibility: %w", namespace, err)
+		return nil, fmt.Errorf("list ExternalModels %s for legacy IPP translation compatibility: %w", scope, err)
 	}
 
 	var affected []string
@@ -405,9 +406,13 @@ func legacyIPPTranslationModels(ctx context.Context, reader client.Reader, param
 
 // servedByTenant reports whether the tenant serves the model: from its own
 // namespace through its Gateway or, for the default tenant (non-nil
-// tenantNS), as a model without gatewayRefs outside tenant namespaces. The
-// shared AppNamespace is out of scope, as for IPP route cleanup. Malformed
-// placement fails closed.
+// tenantNS), as a model without gatewayRefs outside tenant namespaces. A model
+// outside them that names a Gateway never used legacy IPP translation: IPP
+// withdraws its route and skips it, and ai-gateway-controller attaches it only
+// to a tenant that selects Praxis. Unlike ai-gateway-controller's implicit
+// attachment, a model holding its home-tenant finalizer is still counted,
+// which errs toward blocking the migration. The shared AppNamespace is out of
+// scope, as for IPP route cleanup. Malformed placement fails closed.
 func servedByTenant(model *unstructured.Unstructured, namespace string, tenantNS sets.Set[string], params PlatformParams) bool {
 	if model.GetNamespace() == namespace {
 		return externalModelTargetsGateway(model, params)
@@ -423,7 +428,11 @@ func servedByTenant(model *unstructured.Unstructured, namespace string, tenantNS
 // an AITenant claims. The default tenant also serves the ExternalModels without
 // gatewayRefs of every other namespace: ai-gateway-controller attaches them to
 // its Gateway (RHOAIENG-101754), as its IPP served every namespace. Its
-// IPP-to-Praxis migration therefore covers those models too.
+// IPP-to-Praxis migration therefore covers those models too. The CRD admits
+// only the MaasTenantConfig named default-tenant, so any MaasTenantConfig
+// marks a tenant namespace. Claims come from AITenant status.tenantNamespace,
+// as ai-gateway-controller reads them, so both agree on which namespaces are
+// unclaimed.
 func tenantNamespaces(ctx context.Context, reader client.Reader) (sets.Set[string], error) {
 	configs := &maasv1alpha1.MaasTenantConfigList{}
 	if err := reader.List(ctx, configs); err != nil {
