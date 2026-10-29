@@ -126,6 +126,8 @@ func getTLSInfo(extModel *maasv1alpha1.ExternalModel) (tls bool, port int32, err
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;delete
 //+kubebuilder:rbac:groups=networking.istio.io,resources=serviceentries,verbs=get;list;watch;create;update
 //+kubebuilder:rbac:groups=networking.istio.io,resources=destinationrules,verbs=get;list;watch;create;update;delete
+// Changing ownerReferences needs delete permission on the object (OwnerReferencesPermissionEnforcement).
+//+kubebuilder:rbac:groups=inference.opendatahub.io,resources=externalmodels;externalproviders,verbs=get;update;delete
 
 // Reconcile handles create/update/delete of ExternalModel CRs.
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
