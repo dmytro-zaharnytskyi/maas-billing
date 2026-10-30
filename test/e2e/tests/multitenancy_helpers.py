@@ -713,7 +713,16 @@ def apply_gateway_fixture(
                     f"    service.beta.openshift.io/serving-cert-secret-name: \"{service_ca_secret}\"\n"
                     "spec:\n"
                     "  type: ClusterIP\n"
-                )
+                ),
+                # The openshift-default class gives every Gateway an HPA (max 10 at
+                # 80% of a 100m request). Envoy crosses that on every config push,
+                # so each tenant gateway scales out, and dozens of them exhaust the
+                # CI cluster's CPU until new tenant gateways cannot schedule.
+                "horizontalPodAutoscaler": (
+                    "spec:\n"
+                    "  minReplicas: 1\n"
+                    "  maxReplicas: 1\n"
+                ),
             },
         }
     )

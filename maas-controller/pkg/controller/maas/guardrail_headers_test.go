@@ -157,6 +157,55 @@ func TestGuardrailHeaders_DeduplicatesChecksAcrossSelectionScopes(t *testing.T) 
 	}
 }
 
+func TestGuardrailHeaders_SkipsSubscriptionWithDuplicateModelEntry(t *testing.T) {
+	const tenantNamespace = "tenant-a"
+	const modelNamespace = "models"
+	objects := []runtime.Object{
+		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: tenantNamespace, Labels: map[string]string{
+			tenantreconcile.LabelManagedByAITenant: "true",
+		}}},
+		&maasv1alpha1.AITenant{
+			ObjectMeta: metav1.ObjectMeta{Name: "tenant-a", Namespace: "ai-tenants"},
+			Status:     maasv1alpha1.AITenantStatus{TenantNamespace: tenantNamespace},
+		},
+		&maasv1alpha1.MaasTenantConfig{ObjectMeta: metav1.ObjectMeta{
+			Name: maasv1alpha1.MaasTenantConfigInstanceName, Namespace: tenantNamespace, Labels: map[string]string{
+				tenantreconcile.LabelManagedByAITenant: "true",
+			}, Annotations: map[string]string{
+				tenantreconcile.AnnotationAITenantName: "tenant-a", tenantreconcile.AnnotationAITenantNamespace: "ai-tenants",
+			},
+		}},
+		&maasv1alpha1.MaaSSubscription{
+			ObjectMeta: metav1.ObjectMeta{Name: "subscription-a", Namespace: tenantNamespace},
+			Spec: maasv1alpha1.MaaSSubscriptionSpec{ModelRefs: []maasv1alpha1.ModelSubscriptionRef{{
+				Name: "model-a", Namespace: modelNamespace, Unlimited: true, Guardrails: testGuardrailAttachments("entry-policy"),
+			}}},
+		},
+		&maasv1alpha1.MaaSSubscription{
+			ObjectMeta: metav1.ObjectMeta{Name: "subscription-duplicate", Namespace: tenantNamespace},
+			Spec: maasv1alpha1.MaaSSubscriptionSpec{ModelRefs: []maasv1alpha1.ModelSubscriptionRef{
+				{Name: "model-a", Namespace: modelNamespace, Unlimited: true, Guardrails: testGuardrailAttachments("duplicate-policy")},
+				{Name: "model-a", Namespace: modelNamespace, Unlimited: true},
+			}},
+		},
+		&maasv1alpha1.MaaSModelRef{
+			ObjectMeta: metav1.ObjectMeta{Name: "model-a", Namespace: modelNamespace},
+			Status:     maasv1alpha1.MaaSModelStatus{ResolvedTenantRef: "tenant-a"},
+		},
+		testGuardrailPolicy(tenantNamespace, "entry-policy"),
+		testGuardrailPolicy(tenantNamespace, "duplicate-policy"),
+	}
+
+	headers, err := newGuardrailHeaderTestReconciler(t, objects...).guardrailHeaders(context.Background(), tenantNamespace)
+	if err != nil {
+		t.Fatalf("guardrailHeaders() error = %v, want the duplicate-entry subscription skipped", err)
+	}
+	wantID := aiguardrail.CheckID(tenantNamespace, "entry-policy", "pii")
+	if len(headers) != 1 || headers[0].ID != wantID {
+		t.Fatalf("guardrailHeaders() returned %#v, want only %s", headers, wantID)
+	}
+}
+
 func TestGuardrailHeaders_ReturnsNoPartialResultOnResolutionFailure(t *testing.T) {
 	const tenantNamespace = "tenant-a"
 	const modelNamespace = "models"

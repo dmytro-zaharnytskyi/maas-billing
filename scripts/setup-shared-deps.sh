@@ -207,10 +207,11 @@ build_helm_sets() {
   )
 
   # Match the resource sizing applied by the legacy RHCL installer. The
-  # operator's upstream defaults can OOM while reconciling many rate-limit
-  # policies, leaving TokenRateLimitPolicies waiting for Limitador to sync.
+  # operator OOMs while reconciling many rate-limit policies, leaving
+  # TokenRateLimitPolicies waiting for Limitador to sync. 1Gi is not enough:
+  # RHCL 1.4.3 was OOMKilled at 1Gi under the parallel e2e pass.
   HELM_SETS+=(
-    --set-json 'dependencies.rhcl.olm.config.resources={"requests":{"cpu":"200m","memory":"512Mi"},"limits":{"cpu":"1","memory":"1Gi"}}'
+    --set-json 'dependencies.rhcl.olm.config.resources={"requests":{"cpu":"200m","memory":"512Mi"},"limits":{"cpu":"1","memory":"2Gi"}}'
   )
 
   if [[ -n "$RHCL_STARTING_CSV" ]]; then
@@ -476,6 +477,69 @@ post_helm_steps() {
   fi
 }
 
+kuadrant_ready() {
+  kubectl get kuadrant kuadrant -n "$RHCL_NAMESPACE" \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -q True
+}
+
+# kuadrant_operator_startup_failure prints what the Kuadrant operator missed when
+# it started, or nothing. The operator resolves the Kuadrant, Authorino and
+# Limitador kinds once at startup. When OLM starts it before those CRDs are
+# served, it either fails the Kuadrant REST mapping or logs "<component> operator
+# is not installed, skipping related watches and reconcilers" and never creates
+# that component, so authorino or limitador stays missing. Only a restart
+# recovers.
+kuadrant_operator_startup_failure() {
+  kubectl logs deployment/kuadrant-operator-controller-manager \
+    -n "$RHCL_NAMESPACE" --all-containers 2>/dev/null \
+    | grep -Eo 'cannot find RESTMapping for APIVersion kuadrant\.io/v1beta1 Kind Kuadrant|(authorino|limitador) operator is not installed' \
+    | sort -u | paste -sd ',' - || true
+}
+
+restart_kuadrant_operator() {
+  log_warn "Restarting Kuadrant operator, which started before its dependencies were served: $1"
+  kubectl delete pod -n "$RHCL_NAMESPACE" \
+    -l 'app=kuadrant,control-plane=controller-manager' --wait=true
+  kubectl rollout status deployment/kuadrant-operator-controller-manager \
+    -n "$RHCL_NAMESPACE" --timeout="${ROLLOUT_TIMEOUT}s"
+}
+
+wait_for_kuadrant_policy_engine() {
+  log_info "Waiting for Kuadrant policy engine to become ready..."
+  # Wait for the dependency CRDs and the operator rollout first, so the startup
+  # check below reads the operator's final verdict instead of an empty log.
+  wait_for_crd "authorinos.operator.authorino.kuadrant.io" "$CRD_WAIT_TIMEOUT"
+  wait_for_crd "limitadors.limitador.kuadrant.io" "$CRD_WAIT_TIMEOUT"
+  wait_for_resource deployment kuadrant-operator-controller-manager "$RHCL_NAMESPACE"
+  kubectl rollout status deployment/kuadrant-operator-controller-manager \
+    -n "$RHCL_NAMESPACE" --timeout="${ROLLOUT_TIMEOUT}s"
+
+  # Kuadrant can report Ready without Authorino when the operator skipped it, so
+  # check the startup log up front rather than only after a Ready timeout.
+  local startup_failure
+  startup_failure=$(kuadrant_operator_startup_failure)
+  if [[ -n "$startup_failure" ]]; then
+    restart_kuadrant_operator "$startup_failure"
+  fi
+
+  if wait_for_custom_check "Kuadrant ready in ${RHCL_NAMESPACE}" "$CUSTOM_RESOURCE_TIMEOUT" 5 -- kuadrant_ready; then
+    return 0
+  fi
+
+  startup_failure=$(kuadrant_operator_startup_failure)
+  if [[ -z "$startup_failure" ]]; then
+    log_error "Kuadrant did not become ready; Authorino and policy enforcement cannot be used"
+    return 1
+  fi
+  restart_kuadrant_operator "$startup_failure"
+  if ! wait_for_custom_check "Kuadrant ready in ${RHCL_NAMESPACE} after restart" \
+    "$CUSTOM_CHECK_TIMEOUT" 5 -- kuadrant_ready; then
+    log_error "Kuadrant did not become ready after operator restart"
+    return 1
+  fi
+  log_info "Kuadrant recovered after operator restart"
+}
+
 main() {
   if [[ ! "$DEPLOY_MODE" =~ ^(operator|kustomize)$ ]]; then
     log_error "Invalid deployment mode: $DEPLOY_MODE (expected operator or kustomize)"
@@ -542,34 +606,7 @@ main() {
   run_helm_install
 
   if [[ "${POLICY_ENGINE:-rhcl}" =~ ^(rhcl|kuadrant)$ ]]; then
-    log_info "Waiting for Kuadrant policy engine to become ready..."
-    if ! wait_for_custom_check "Kuadrant ready in ${RHCL_NAMESPACE}" "$CUSTOM_RESOURCE_TIMEOUT" 5 -- \
-      bash -c "kubectl get kuadrant kuadrant -n '${RHCL_NAMESPACE}' -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True"; then
-      local operator_logs
-      operator_logs=$(kubectl logs deployment/kuadrant-operator-controller-manager \
-        -n "$RHCL_NAMESPACE" --all-containers --tail=200 2>/dev/null || true)
-
-      if grep -Fq 'cannot find RESTMapping for APIVersion kuadrant.io/v1beta1 Kind Kuadrant' \
-        <<<"$operator_logs"; then
-        log_warn "Restarting Kuadrant operator after transient REST mapping failure..."
-        kubectl delete pod -n "$RHCL_NAMESPACE" \
-          -l 'app=kuadrant,control-plane=controller-manager' --wait=true
-        kubectl rollout status deployment/kuadrant-operator-controller-manager \
-          -n "$RHCL_NAMESPACE" --timeout="${ROLLOUT_TIMEOUT}s"
-
-        if ! wait_for_custom_check "Kuadrant ready in ${RHCL_NAMESPACE} after restart" \
-          "$CUSTOM_CHECK_TIMEOUT" 5 -- \
-          bash -c "kubectl get kuadrant kuadrant -n '${RHCL_NAMESPACE}' -o jsonpath='{.status.conditions[?(@.type==\"Ready\")].status}' 2>/dev/null | grep -q True"; then
-          log_error "Kuadrant did not become ready after operator restart"
-          return 1
-        fi
-
-        log_info "Kuadrant recovered after operator restart"
-      else
-        log_error "Kuadrant did not become ready; Authorino and policy enforcement cannot be used"
-        return 1
-      fi
-    fi
+    wait_for_kuadrant_policy_engine
   fi
 
   post_helm_steps

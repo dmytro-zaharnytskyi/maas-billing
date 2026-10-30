@@ -18,6 +18,7 @@ package maas
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -145,6 +146,12 @@ func (r *MaaSAuthPolicyReconciler) guardrailHeaders(ctx context.Context, tenantN
 				model.Name,
 			)
 			if err != nil {
+				// maas-api refuses to select guardrails through a subscription that lists
+				// the same model twice, so it has no checks to advertise. Failing here would
+				// instead block the gateway AuthPolicy for every policy in the tenant.
+				if errors.Is(err, maasguardrail.ErrModelEntryAmbiguous) {
+					continue
+				}
 				return nil, fmt.Errorf("compose guardrails for subscription %s/%s and model %s/%s: %w", subscription.Namespace, subscription.Name, model.Namespace, model.Name, err)
 			}
 
