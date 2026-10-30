@@ -32,7 +32,9 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	gatewayapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	maasv1alpha1 "github.com/opendatahub-io/models-as-a-service/maas-controller/api/maas/v1alpha1"
@@ -588,6 +590,53 @@ func TestReconcile_SupersededReleasesMigratedResources(t *testing.T) {
 	gotEM.SetGroupVersionKind(inferenceExternalModelGVK)
 	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, gotEM))
 	assert.Equal(t, []metav1.OwnerReference{otherOwner}, gotEM.GetOwnerReferences(), "unrelated owners are kept")
+
+	gotLegacy := &maasv1alpha1.ExternalModel{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, gotLegacy))
+	assert.Equal(t, "Migrated", gotLegacy.Status.Phase, "the release must not hide the route name from the superseded check")
+}
+
+// TestReconcile_InferenceLookupGets verifies how often a reconcile reads the
+// inference resources: the ExternalModel once, and the ExternalProvider only
+// when that ExternalModel exists.
+func TestReconcile_InferenceLookupGets(t *testing.T) {
+	const (
+		name     = "gpt-4o"
+		ns       = "llm"
+		endpoint = "api.openai.com"
+	)
+	tests := []struct {
+		name         string
+		objects      []client.Object
+		wantProvider int
+	}{
+		{name: "no inference ExternalModel", wantProvider: 0},
+		{name: "inference ExternalModel exists", objects: []client.Object{newInferenceExternalModel(name, ns, "")}, wantProvider: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gets := map[schema.GroupVersionKind]int{}
+			c := fake.NewClientBuilder().WithScheme(testScheme).
+				WithStatusSubresource(&maasv1alpha1.ExternalModel{}).
+				WithObjects(newTestExternalModel(name, ns, endpoint, nil)).
+				WithObjects(tt.objects...).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Get: func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+						if u, ok := obj.(*unstructured.Unstructured); ok {
+							gets[u.GroupVersionKind()]++
+						}
+						return cl.Get(ctx, key, obj, opts...)
+					},
+				}).
+				Build()
+			r := &Reconciler{Client: c, Scheme: testScheme, Log: ctrl.Log, GatewayName: "maas-gw", GatewayNamespace: "ingress"}
+			_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+			require.NoError(t, err)
+
+			assert.Equal(t, 1, gets[inferenceExternalModelGVK])
+			assert.Equal(t, tt.wantProvider, gets[inferenceExternalProviderGVK])
+		})
+	}
 }
 
 // TestReconcile_InferenceNotReadyReleasesMigratedResources verifies that the
