@@ -147,6 +147,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
+	// Release before the superseded check: an inference ExternalModel without a
+	// route name yet would still be garbage-collected with its legacy owner.
+	if err := r.releaseMigratedResources(ctx, extModel); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// If an inference.opendatahub.io ExternalModel exists for this model,
 	// the IPP controller owns networking. Tear down legacy maas-* children.
 	if superseded, err := r.isSupersededByInference(ctx, extModel); err != nil {
@@ -155,9 +161,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		oteljson.FromContext(ctx).Info("inference ExternalModel exists, tearing down legacy networking",
 			"name", req.Name, "namespace", req.Namespace)
 		if _, err := r.teardownLegacyChildren(ctx, extModel); err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := r.releaseMigratedResources(ctx, extModel); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{}, r.markMigrated(ctx, extModel)

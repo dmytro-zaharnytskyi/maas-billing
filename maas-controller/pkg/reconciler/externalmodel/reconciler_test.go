@@ -590,6 +590,53 @@ func TestReconcile_SupersededReleasesMigratedResources(t *testing.T) {
 	assert.Equal(t, []metav1.OwnerReference{otherOwner}, gotEM.GetOwnerReferences(), "unrelated owners are kept")
 }
 
+// TestReconcile_InferenceNotReadyReleasesMigratedResources verifies that the
+// legacy ExternalModel stops owning the migrated resources before the inference
+// ExternalModel has a route name, while keeping its legacy networking and phase.
+func TestReconcile_InferenceNotReadyReleasesMigratedResources(t *testing.T) {
+	const (
+		name     = "gpt-4o"
+		ns       = "llm"
+		endpoint = "api.openai.com"
+	)
+	em := newTestExternalModel(name, ns, endpoint, nil)
+	em.UID = "legacy-uid"
+	owner := metav1.OwnerReference{APIVersion: maasv1alpha1.GroupVersion.String(), Kind: "ExternalModel", Name: name, UID: em.UID}
+	migrated := map[string]string{labelManagedBy: managedByIPPLegacyMigration, labelMigratedFrom: name}
+
+	inferenceEM := newInferenceExternalModel(name, ns, "")
+	inferenceEM.SetLabels(migrated)
+	inferenceEM.SetOwnerReferences([]metav1.OwnerReference{owner})
+	inferenceEP := &unstructured.Unstructured{}
+	inferenceEP.SetGroupVersionKind(inferenceExternalProviderGVK)
+	inferenceEP.SetName(name)
+	inferenceEP.SetNamespace(ns)
+	inferenceEP.SetLabels(migrated)
+	inferenceEP.SetOwnerReferences([]metav1.OwnerReference{owner})
+
+	c := fake.NewClientBuilder().WithScheme(testScheme).
+		WithStatusSubresource(&maasv1alpha1.ExternalModel{}).
+		WithObjects(em, inferenceEM, inferenceEP).
+		Build()
+	r := &Reconciler{Client: c, Scheme: testScheme, Log: ctrl.Log, GatewayName: "maas-gw", GatewayNamespace: "ingress"}
+	_, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: name, Namespace: ns}})
+	require.NoError(t, err)
+
+	for _, gvk := range []schema.GroupVersionKind{inferenceExternalModelGVK, inferenceExternalProviderGVK} {
+		got := &unstructured.Unstructured{}
+		got.SetGroupVersionKind(gvk)
+		require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, got))
+		assert.Empty(t, got.GetOwnerReferences(), "%s still owned by the legacy ExternalModel", gvk.Kind)
+	}
+
+	resourceName := modelnaming.ExternalModelResourceName(name)
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: resourceName, Namespace: ns}, &gatewayapiv1.HTTPRoute{}),
+		"legacy HTTPRoute must stay while the inference route is not Ready")
+	gotEM := &maasv1alpha1.ExternalModel{}
+	require.NoError(t, c.Get(context.Background(), types.NamespacedName{Name: name, Namespace: ns}, gotEM))
+	assert.NotEqual(t, "Migrated", gotEM.Status.Phase)
+}
+
 // TestReconcile_SupersededKeepsOwnersOfUnmigratedResources verifies that an
 // inference ExternalModel IPP's legacy migration did not create keeps its
 // owner references.

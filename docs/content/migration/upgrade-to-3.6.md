@@ -142,12 +142,13 @@ ai-gateway-controller applies its own provider transport.
 
 ## Legacy `maas.opendatahub.io` ExternalModels
 
-A legacy ExternalModel that IPP migrated reports `status.phase: Migrated`. Once
-it is Migrated, maas-controller removes its owner reference from the
-`inference.opendatahub.io` ExternalModel and ExternalProvider created for it, so
-deleting the deprecated legacy object no longer deletes the live model. On
-releases without this change, delete the legacy object with
-`kubectl delete externalmodels.maas.opendatahub.io <name> --cascade=orphan`.
+A legacy ExternalModel that IPP migrated reports `status.phase: Migrated`. When
+it reconciles a legacy object, maas-controller removes its owner reference from
+the `inference.opendatahub.io` ExternalModel and ExternalProvider created for it,
+even before the object is Migrated, so deleting the deprecated legacy object no
+longer deletes the live model. On releases without this change, or if
+maas-controller has not reconciled the legacy object since the upgrade, delete
+it with `kubectl delete externalmodels.maas.opendatahub.io <name> --cascade=orphan`.
 ## Legacy metrics usage dashboard is opt-in
 
 `Config.spec.usageMetricsDashboard` defaults to `false`. After upgrade, the operator removes any controller-owned copy of the Prometheus-based Perses dashboard (`dashboard-3-maas-usage-admin`). To keep it:
